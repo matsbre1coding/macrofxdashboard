@@ -11,7 +11,7 @@ import plotly.express as px
 import streamlit as st
 
 
-APP_VERSION = "v1.4 UX"
+APP_VERSION = "v1.4.1 Heute UX"
 
 
 st.set_page_config(
@@ -96,6 +96,15 @@ STATUS_LABELS = {
 }
 
 
+MODE_LABELS = {
+    "Data Health": "Datenqualität",
+    "Policy Divergence": "Zins-/Policy-Divergenz",
+    "Mean Reversion / Exhaustion": "Überdehnung / Rücklauf",
+    "Macro Trend Baseline": "Makro-Trend",
+    "Defensive / Liquidity": "Defensive / Liquidität",
+}
+
+
 FIELD_LABELS = {
     "growth_score": "Wachstum",
     "inflation_score": "Inflation",
@@ -103,6 +112,32 @@ FIELD_LABELS = {
     "risk_score": "Risiko",
     "commodity_score": "Rohstoffe",
     "usd_score": "USD",
+}
+
+
+HISTORY_LABELS = {
+    "Robust OOS": "OOS robust",
+    "Validation ok / test weak": "Validierung ok, jüngster Test schwach",
+    "Recent-only watch": "Nur zuletzt auffällig",
+    "Train-only risk": "Nur im Training gut",
+    "Mixed / weak": "Gemischt / schwach",
+    "": "n/a",
+}
+
+
+REASON_LABELS = {
+    "OOS/watch support exists, but regime conflict or stale CPI blocks clean actionability.": "Historie ist interessant, aber Regime-Konflikt oder CPI-Lücke blockiert ein sauberes Live-Signal.",
+    "Historical support exists, but current ensemble does not promote it.": "Historie ist teilweise interessant, aktuell aber nur Kontext.",
+    "Fails at least one frozen baseline or ensemble gate.": "Fällt durch mindestens einen festen Filter.",
+}
+
+
+BAYES_LABELS = {
+    "Soft conflict": "weicher Konflikt",
+    "Conflict": "Konflikt",
+    "Mixed / uncertain": "unsicher",
+    "Soft confirmation": "leichte Bestätigung",
+    "Confirmed": "bestätigt",
 }
 
 
@@ -313,6 +348,22 @@ def friendly_status(value: str) -> str:
     return STATUS_LABELS.get(str(value), str(value))
 
 
+def friendly_mode(value: str) -> str:
+    return MODE_LABELS.get(str(value), str(value))
+
+
+def friendly_history(value: str) -> str:
+    return HISTORY_LABELS.get(str(value), str(value))
+
+
+def friendly_reason(value: str) -> str:
+    return REASON_LABELS.get(str(value), str(value))
+
+
+def friendly_bayes(value: str) -> str:
+    return BAYES_LABELS.get(str(value), str(value))
+
+
 def metric_card(label: str, value: str, detail: str = "", tone: str = "info") -> None:
     st.markdown(
         f"""
@@ -382,8 +433,10 @@ def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
     out["Status"] = out.get("ensemble_action", "").map(friendly_action)
     out["Einsatz"] = out.get("position_permission", "").map(friendly_permission)
     out["Idee"] = out.get("expression", "")
-    out["Historie"] = out.get("rates_oos_label", "").astype(str) + " / " + out.get("cpi_oos_label", "").astype(str)
-    out["Hinweis"] = out.get("ensemble_reason", "")
+    rates_history = out.get("rates_oos_label", "").astype(str).map(friendly_history)
+    real_history = out.get("cpi_oos_label", "").astype(str).map(friendly_history)
+    out["Historie"] = "Zinsen: " + rates_history + " | Realzins: " + real_history
+    out["Hinweis"] = out.get("ensemble_reason", "").astype(str).map(friendly_reason)
     out["Score"] = pd.to_numeric(
         out.get("ensemble_final_score", pd.Series(index=out.index, dtype=float)),
         errors="coerce",
@@ -394,14 +447,21 @@ def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def explain_today(regime: str, posture: str, gate: str, stale: str) -> str:
+def explain_today(regime: str, posture: str, gate: str, stale: str, model_regime: str = "n/a", bayes_read: str = "n/a") -> str:
     regime_text = REGIME_EXPLANATIONS.get(regime, "Das aktuelle Regime wird aus Wachstum, Inflation, Zinsen, Risiko, Rohstoffen und USD-Stärke abgeleitet.")
+    gate_text = "geschlossen" if gate == "Closed" else str(gate)
+    model_note = ""
+    if model_regime not in ["n/a", "", regime]:
+        model_note = (
+            f" Die Markov/Bayes-Schicht warnt zwar auf {model_regime}, "
+            f"aber der Abgleich mit den echten Treibern lautet {friendly_bayes(bayes_read)}; deshalb bleibt es eine Warnung, kein Hauptsignal."
+        )
     if "No clean" in posture:
         return (
             f"{regime_text} Das Dashboard gibt deshalb aktuell kein sauberes Baseline-Signal frei. "
-            f"Der Trend-Filter steht auf {gate}; Datenlücken gibt es bei {stale}."
+            f"Der Trend-Filter steht auf {gate_text}; Datenlücken gibt es bei {stale}.{model_note}"
         )
-    return f"{regime_text} Der aktuelle Signalstatus lautet: {posture}."
+    return f"{regime_text} Der aktuelle Signalstatus lautet: {posture}.{model_note}"
 
 
 def today_view(frames: Dict[str, pd.DataFrame]) -> None:
@@ -416,11 +476,13 @@ def today_view(frames: Dict[str, pd.DataFrame]) -> None:
     policy_watch = lookup(regime, "Policy watch candidates")
     stale = lookup(regime, "Stale CPI currencies")
     confidence = lookup(regime, "Final regime confidence")
+    prob_top = lookup(regime, "Probabilistic top regime")
+    bayes_read = lookup(regime, "Bayesian read")
 
     readable_posture = "Kein sauberes Signal" if "No clean" in posture else posture
     hero_card(
         readable_posture,
-        explain_today(final_regime, posture, gate, stale),
+        explain_today(final_regime, posture, gate, stale, prob_top, bayes_read),
         "Aktueller Markt-Check",
     )
 
@@ -437,6 +499,14 @@ def today_view(frames: Dict[str, pd.DataFrame]) -> None:
     with cols[4]:
         metric_card("Datenlücken", stale, "Diese Währungen sind noch nicht sauber genug für Real-Rate-Signale.", "watch")
 
+    model_cols = st.columns(3)
+    with model_cols[0]:
+        metric_card("Scorecard sagt", final_regime, "Die Scorecard ist die primäre Marktphase.", "good")
+    with model_cols[1]:
+        metric_card("Markov/Bayes warnt", prob_top, f"Lesart: {friendly_bayes(bayes_read)}", "watch")
+    with model_cols[2]:
+        metric_card("Was jetzt tun?", "Research / Paper", "Live-Signal erst, wenn Regime, Historie und Datenqualität zusammenpassen.", "bad")
+
     st.divider()
     left, right = st.columns([1.05, 1.0])
     with left:
@@ -450,6 +520,12 @@ def today_view(frames: Dict[str, pd.DataFrame]) -> None:
                 x="semantic_fit_score",
                 y="regime",
                 color="Bewertung",
+                color_discrete_map={
+                    "Passt stark": "#22c55e",
+                    "Plausibel": "#84cc16",
+                    "Gemischt": "#f59e0b",
+                    "Passt nicht": "#ef4444",
+                },
                 orientation="h",
                 range_x=[0, 100],
                 labels={"semantic_fit_score": "Passung", "regime": "Marktphase"},
@@ -464,15 +540,23 @@ def today_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.markdown('<div class="section-note">Das ist die Betriebsart des Dashboards: handeln, beobachten, forschen oder Daten verbessern.</div>', unsafe_allow_html=True)
         if not strategy.empty and {"mode", "conviction"}.issubset(strategy.columns):
             plot_df = strategy.copy()
+            plot_df["Modus"] = plot_df["mode"].map(friendly_mode)
             plot_df["Status"] = plot_df.get("status", "").map(friendly_status)
             fig = px.bar(
                 plot_df.sort_values("conviction"),
                 x="conviction",
-                y="mode",
+                y="Modus",
                 color="Status",
+                color_discrete_map={
+                    "Aktiv": "#22c55e",
+                    "Beobachten": "#f59e0b",
+                    "Research": "#60a5fa",
+                    "Geschlossen": "#ef4444",
+                    "Aus": "#64748b",
+                },
                 orientation="h",
                 range_x=[0, 100],
-                labels={"conviction": "Relevanz", "mode": "Modus"},
+                labels={"conviction": "Relevanz", "Modus": "Modus"},
             )
             fig.update_layout(height=390, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
             st.plotly_chart(fig, use_container_width=True)
