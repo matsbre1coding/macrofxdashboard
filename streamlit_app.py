@@ -12,7 +12,7 @@ import plotly.express as px
 import streamlit as st
 
 
-APP_VERSION = "v1.5 Product UX"
+APP_VERSION = "v1.5.1 Product UX"
 
 
 st.set_page_config(
@@ -773,7 +773,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
         fig = px.imshow(
             matrix,
             color_continuous_scale="RdYlGn",
-            zmid=0,
+            color_continuous_midpoint=0,
             aspect="auto",
             labels=dict(x="Against", y="Currency", color="Bias"),
         )
