@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import html
 import os
 import zipfile
 from pathlib import Path
@@ -11,7 +12,7 @@ import plotly.express as px
 import streamlit as st
 
 
-APP_VERSION = "v1.4.1 Heute UX"
+APP_VERSION = "v1.5 Product UX"
 
 
 st.set_page_config(
@@ -229,6 +230,115 @@ def inject_css() -> None:
             margin-top: -0.25rem;
             margin-bottom: 0.9rem;
         }
+        .overview-panel {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 10px;
+            padding: 18px 20px;
+            background: linear-gradient(135deg, rgba(15, 23, 42, 0.92), rgba(17, 24, 39, 0.74));
+            min-height: 174px;
+        }
+        .overview-panel .headline {
+            color: #f8fafc;
+            font-size: 1.9rem;
+            font-weight: 760;
+            line-height: 1.12;
+            margin-bottom: 8px;
+        }
+        .overview-panel .body {
+            color: #cbd5e1;
+            font-size: 0.98rem;
+            line-height: 1.45;
+            max-width: 980px;
+        }
+        .mini-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 16px;
+        }
+        .mini-stat {
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 8px;
+            padding: 10px 12px;
+            background: rgba(2, 6, 23, 0.28);
+        }
+        .mini-stat .k {
+            color: #94a3b8;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+        .mini-stat .v {
+            color: #f8fafc;
+            font-size: 1.0rem;
+            font-weight: 730;
+        }
+        .pair-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 8px;
+        }
+        .pair-card {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 8px;
+            padding: 13px 14px;
+            background: rgba(15, 23, 42, 0.66);
+            min-height: 142px;
+        }
+        .pair-card .pair {
+            color: #f8fafc;
+            font-size: 1.1rem;
+            font-weight: 760;
+            margin-bottom: 4px;
+        }
+        .pair-card .idea {
+            color: #cbd5e1;
+            font-size: 0.84rem;
+            margin-bottom: 10px;
+            min-height: 28px;
+        }
+        .pair-card .score {
+            color: #f8fafc;
+            font-size: 1.35rem;
+            font-weight: 760;
+            margin-bottom: 6px;
+        }
+        .pill {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 3px 8px;
+            font-size: 0.73rem;
+            font-weight: 700;
+            margin-right: 5px;
+            margin-top: 4px;
+        }
+        .pill-watch { background: rgba(245, 158, 11, 0.18); color: #fbbf24; }
+        .pill-good { background: rgba(34, 197, 94, 0.16); color: #86efac; }
+        .pill-bad { background: rgba(239, 68, 68, 0.16); color: #fca5a5; }
+        .pill-info { background: rgba(96, 165, 250, 0.16); color: #93c5fd; }
+        .currency-strip {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 8px;
+        }
+        .currency-card {
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            border-radius: 8px;
+            padding: 12px;
+            background: rgba(15, 23, 42, 0.58);
+        }
+        .currency-card .ccy {
+            color: #f8fafc;
+            font-weight: 760;
+            font-size: 1.08rem;
+        }
+        .currency-card .line {
+            color: #94a3b8;
+            font-size: 0.8rem;
+            margin-top: 4px;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -377,7 +487,7 @@ def metric_card(label: str, value: str, detail: str = "", tone: str = "info") ->
     )
 
 
-def hero_card(title: str, text: str, eyebrow: str = "Heute") -> None:
+def hero_card(title: str, text: str, eyebrow: str = "Overview") -> None:
     st.markdown(
         f"""
         <div class="hero">
@@ -405,20 +515,51 @@ def missing_files_panel(frames: Dict[str, pd.DataFrame]) -> None:
         st.dataframe(pd.DataFrame({"Datei": missing}), use_container_width=True, hide_index=True)
 
 
-def signal_tone(posture: str) -> str:
-    text = str(posture).lower()
-    if "no clean" in text or "kein" in text:
-        return "bad"
-    if "watch" in text or "research" in text or "beobachten" in text:
-        return "watch"
-    return "good"
+def safe_text(value: object, default: str = "n/a") -> str:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except TypeError:
+        pass
+    return str(value)
+
+
+def esc(value: object, default: str = "n/a") -> str:
+    return html.escape(safe_text(value, default))
+
+
+def frame_col(frame: pd.DataFrame, column: str, default: object = "") -> pd.Series:
+    if column in frame.columns:
+        return frame[column]
+    return pd.Series(default, index=frame.index)
+
+
+def to_float(value: object, default: float = 0.0) -> float:
+    try:
+        parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(parsed):
+            return default
+        return float(parsed)
+    except Exception:
+        return default
+
+
+def to_bool_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return series.astype(bool)
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False)
+    text = series.astype(str).str.strip().str.lower()
+    return text.isin(["true", "1", "yes", "y", "ja"])
 
 
 def sort_signal_board(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
     out = frame.copy()
-    out["_order"] = out.get("ensemble_action", "").map(ACTION_ORDER).fillna(99)
+    out["_order"] = frame_col(out, "ensemble_action").map(ACTION_ORDER).fillna(99)
     if "ensemble_final_score" in out.columns:
         out = out.sort_values(["_order", "ensemble_final_score"], ascending=[True, False])
     else:
@@ -426,316 +567,410 @@ def sort_signal_board(frame: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns=["_order"])
 
 
+def action_tone(action: str) -> str:
+    label = friendly_action(action)
+    if label == "Beobachten":
+        return "watch"
+    if label == "Ignorieren":
+        return "bad"
+    if label == "Handelbar":
+        return "good"
+    return "info"
+
+
+def readable_posture(value: str) -> str:
+    if "No clean" in str(value):
+        return "No clean live signal"
+    return safe_text(value)
+
+
+def overview_reason(regime: str, posture: str, gate: str, stale: str, prob_top: str, bayes_read: str) -> str:
+    regime_text = REGIME_EXPLANATIONS.get(regime, "Die Marktphase wird aus Wachstum, Inflation, Zinsen, Risiko, Rohstoffen und USD-Druck abgeleitet.")
+    gate_text = "closed" if gate == "Closed" else safe_text(gate)
+    model_note = ""
+    if prob_top not in ["", "n/a", regime]:
+        model_note = (
+            f" Markov/Bayes gives a second-opinion warning for {prob_top}, "
+            f"but the driver check is {friendly_bayes(bayes_read)}."
+        )
+    if "No clean" in str(posture):
+        return f"{regime_text} Trend gate is {gate_text}; stale CPI blocks clean real-rate use for {stale}.{model_note}"
+    return f"{regime_text} Current posture: {posture}.{model_note}"
+
+
+def clean_currency_count(permission: pd.DataFrame) -> tuple[int, int]:
+    if permission.empty or "currency" not in permission.columns:
+        return 0, 0
+    total = permission["currency"].nunique()
+    if "can_use_real_rate" in permission.columns:
+        clean = int(to_bool_series(permission["can_use_real_rate"]).sum())
+    elif "data_quality" in permission.columns:
+        clean = int(permission["data_quality"].astype(str).eq("Good").sum())
+    else:
+        clean = 0
+    return clean, total
+
+
+def build_currency_strength(signals: pd.DataFrame, permission: pd.DataFrame) -> pd.DataFrame:
+    currencies = set()
+    for column in ["long_currency", "short_currency", "base_currency", "quote_currency"]:
+        if column in signals.columns:
+            currencies.update(signals[column].dropna().astype(str).str.upper().tolist())
+    if "currency" in permission.columns:
+        currencies.update(permission["currency"].dropna().astype(str).str.upper().tolist())
+    if not currencies:
+        currencies = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
+
+    rows = {currency: {"currency": currency, "strength": 0.0, "ideas": 0} for currency in sorted(currencies)}
+    for _, row in signals.iterrows():
+        long_ccy = safe_text(row.get("long_currency", "")).upper()
+        short_ccy = safe_text(row.get("short_currency", "")).upper()
+        if not long_ccy or not short_ccy or long_ccy == "N/A" or short_ccy == "N/A":
+            continue
+        score = abs(to_float(row.get("abs_score", row.get("bias_score", 0.0))))
+        action = safe_text(row.get("ensemble_action", ""))
+        weight = {"Research watch only": 1.0, "Context watch": 0.65, "Research / no action": 0.25}.get(action, 0.55)
+        contribution = score * weight
+        rows.setdefault(long_ccy, {"currency": long_ccy, "strength": 0.0, "ideas": 0})
+        rows.setdefault(short_ccy, {"currency": short_ccy, "strength": 0.0, "ideas": 0})
+        rows[long_ccy]["strength"] += contribution
+        rows[short_ccy]["strength"] -= contribution
+        rows[long_ccy]["ideas"] += 1
+        rows[short_ccy]["ideas"] += 1
+
+    strength = pd.DataFrame(rows.values())
+    if not permission.empty and "currency" in permission.columns:
+        meta_cols = [col for col in ["currency", "data_quality", "permission", "policy_mode", "can_use_real_rate", "can_use_rates_only"] if col in permission.columns]
+        meta = permission[meta_cols].copy()
+        meta["currency"] = meta["currency"].astype(str).str.upper()
+        strength = strength.merge(meta.drop_duplicates("currency"), on="currency", how="left")
+    strength["strength"] = pd.to_numeric(strength["strength"], errors="coerce").fillna(0.0).round(2)
+    strength["read"] = strength["strength"].apply(lambda x: "Strong" if x > 0.25 else ("Weak" if x < -0.25 else "Neutral"))
+    return strength.sort_values("strength", ascending=False)
+
+
+def build_pair_matrix(signals: pd.DataFrame, currencies: list[str]) -> pd.DataFrame:
+    matrix = pd.DataFrame(0.0, index=currencies, columns=currencies)
+    if signals.empty:
+        return matrix
+    for _, row in signals.iterrows():
+        long_ccy = safe_text(row.get("long_currency", "")).upper()
+        short_ccy = safe_text(row.get("short_currency", "")).upper()
+        if long_ccy not in matrix.index or short_ccy not in matrix.columns:
+            continue
+        score = abs(to_float(row.get("abs_score", row.get("bias_score", 0.0))))
+        if abs(score) >= abs(matrix.loc[long_ccy, short_ccy]):
+            matrix.loc[long_ccy, short_ccy] = score
+            matrix.loc[short_ccy, long_ccy] = -score
+    return matrix.round(2)
+
+
 def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
     if signals.empty:
         return signals
     out = signals.copy()
-    out["Status"] = out.get("ensemble_action", "").map(friendly_action)
-    out["Einsatz"] = out.get("position_permission", "").map(friendly_permission)
-    out["Idee"] = out.get("expression", "")
-    rates_history = out.get("rates_oos_label", "").astype(str).map(friendly_history)
-    real_history = out.get("cpi_oos_label", "").astype(str).map(friendly_history)
-    out["Historie"] = "Zinsen: " + rates_history + " | Realzins: " + real_history
-    out["Hinweis"] = out.get("ensemble_reason", "").astype(str).map(friendly_reason)
-    out["Score"] = pd.to_numeric(
-        out.get("ensemble_final_score", pd.Series(index=out.index, dtype=float)),
-        errors="coerce",
-    ).round(2)
-    cols = ["pair", "Idee", "Status", "Einsatz", "Score", "Historie", "Hinweis"]
+    out["Status"] = frame_col(out, "ensemble_action").astype(str).map(friendly_action)
+    out["Use"] = frame_col(out, "position_permission").astype(str).map(friendly_permission)
+    out["Idea"] = frame_col(out, "expression")
+    rates_history = frame_col(out, "rates_oos_label").astype(str).map(friendly_history)
+    real_history = frame_col(out, "cpi_oos_label").astype(str).map(friendly_history)
+    out["History"] = "Rates: " + rates_history + " | Real-rate: " + real_history
+    out["Why"] = frame_col(out, "ensemble_reason").astype(str).map(friendly_reason)
+    out["Score"] = pd.to_numeric(frame_col(out, "ensemble_final_score", 0.0), errors="coerce").round(2)
+    cols = ["pair", "Idea", "Status", "Use", "Score", "History", "Why"]
     cols = [col for col in cols if col in out.columns]
-    result = out[cols].rename(columns={"pair": "Pair"})
-    return result
+    return out[cols].rename(columns={"pair": "Pair"})
 
 
-def explain_today(regime: str, posture: str, gate: str, stale: str, model_regime: str = "n/a", bayes_read: str = "n/a") -> str:
-    regime_text = REGIME_EXPLANATIONS.get(regime, "Das aktuelle Regime wird aus Wachstum, Inflation, Zinsen, Risiko, Rohstoffen und USD-Stärke abgeleitet.")
-    gate_text = "geschlossen" if gate == "Closed" else str(gate)
-    model_note = ""
-    if model_regime not in ["n/a", "", regime]:
-        model_note = (
-            f" Die Markov/Bayes-Schicht warnt zwar auf {model_regime}, "
-            f"aber der Abgleich mit den echten Treibern lautet {friendly_bayes(bayes_read)}; deshalb bleibt es eine Warnung, kein Hauptsignal."
-        )
-    if "No clean" in posture:
-        return (
-            f"{regime_text} Das Dashboard gibt deshalb aktuell kein sauberes Baseline-Signal frei. "
-            f"Der Trend-Filter steht auf {gate_text}; Datenlücken gibt es bei {stale}.{model_note}"
-        )
-    return f"{regime_text} Der aktuelle Signalstatus lautet: {posture}.{model_note}"
-
-
-def today_view(frames: Dict[str, pd.DataFrame]) -> None:
-    regime = get_frame(frames, "ensemble_regime")
-    alignment = get_frame(frames, "ensemble_alignment")
-    strategy = get_frame(frames, "ensemble_strategy")
-    signals = sort_signal_board(get_frame(frames, "ensemble_signals"))
-
+def render_overview_panel(regime: pd.DataFrame, permission: pd.DataFrame) -> None:
     final_regime = lookup(regime, "Final regime read")
     posture = lookup(regime, "Current posture")
     gate = lookup(regime, "Macro trend gate")
-    policy_watch = lookup(regime, "Policy watch candidates")
     stale = lookup(regime, "Stale CPI currencies")
     confidence = lookup(regime, "Final regime confidence")
     prob_top = lookup(regime, "Probabilistic top regime")
     bayes_read = lookup(regime, "Bayesian read")
-
-    readable_posture = "Kein sauberes Signal" if "No clean" in posture else posture
-    hero_card(
-        readable_posture,
-        explain_today(final_regime, posture, gate, stale, prob_top, bayes_read),
-        "Aktueller Markt-Check",
+    clean, total = clean_currency_count(permission)
+    headline = readable_posture(posture)
+    body = overview_reason(final_regime, posture, gate, stale, prob_top, bayes_read)
+    st.markdown(
+        f"""
+        <div class="overview-panel">
+            <div class="headline">{esc(headline)}</div>
+            <div class="body">{esc(body)}</div>
+            <div class="mini-grid">
+                <div class="mini-stat"><div class="k">Macro Regime</div><div class="v">{esc(final_regime)}</div></div>
+                <div class="mini-stat"><div class="k">Confidence</div><div class="v">{esc(confidence)}/100</div></div>
+                <div class="mini-stat"><div class="k">Clean Currencies</div><div class="v">{clean}/{total}</div></div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    cols = st.columns(5)
-    with cols[0]:
-        metric_card("Marktphase", final_regime, f"Vertrauen: {confidence}/100", "watch")
-    with cols[1]:
-        metric_card("Signalstatus", readable_posture, lookup(regime, "Current posture", "detail"), signal_tone(posture))
-    with cols[2]:
-        gate_label = "Geschlossen" if gate == "Closed" else gate
-        metric_card("Trend-Signal erlaubt?", gate_label, "Nur wenn der Regime-Filter offen ist.", "bad" if gate == "Closed" else "good")
-    with cols[3]:
-        metric_card("Watchlist", policy_watch, "Ideen zum Beobachten, nicht automatisch handeln.", "watch")
-    with cols[4]:
-        metric_card("Datenlücken", stale, "Diese Währungen sind noch nicht sauber genug für Real-Rate-Signale.", "watch")
 
-    model_cols = st.columns(3)
-    with model_cols[0]:
-        metric_card("Scorecard sagt", final_regime, "Die Scorecard ist die primäre Marktphase.", "good")
-    with model_cols[1]:
-        metric_card("Markov/Bayes warnt", prob_top, f"Lesart: {friendly_bayes(bayes_read)}", "watch")
-    with model_cols[2]:
-        metric_card("Was jetzt tun?", "Research / Paper", "Live-Signal erst, wenn Regime, Historie und Datenqualität zusammenpassen.", "bad")
+def render_pair_cards(signals: pd.DataFrame, limit: int = 4) -> None:
+    if signals.empty:
+        st.info("No pair ideas loaded.")
+        return
+    top = sort_signal_board(signals).head(limit)
+    cards = []
+    for _, row in top.iterrows():
+        pair = row.get("pair", "n/a")
+        idea = row.get("expression", "n/a")
+        score = to_float(row.get("ensemble_final_score", row.get("abs_score", 0.0)))
+        status = friendly_action(safe_text(row.get("ensemble_action", "")))
+        use = friendly_permission(safe_text(row.get("position_permission", "")))
+        tone = action_tone(safe_text(row.get("ensemble_action", "")))
+        cards.append(
+            f"""
+            <div class="pair-card">
+                <div class="pair">{esc(pair)}</div>
+                <div class="idea">{esc(idea)}</div>
+                <div class="score">{score:.2f}</div>
+                <span class="pill pill-{tone}">{esc(status)}</span>
+                <span class="pill pill-info">{esc(use)}</span>
+            </div>
+            """
+        )
+    st.markdown(f'<div class="pair-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
+
+def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
+    regime = get_frame(frames, "ensemble_regime")
+    signals = sort_signal_board(get_frame(frames, "ensemble_signals"))
+    permission = get_frame(frames, "currency_permission")
+    calibrated = get_frame(frames, "calibrated_latest")
+
+    render_overview_panel(regime, permission)
     st.divider()
-    left, right = st.columns([1.05, 1.0])
+
+    strength = build_currency_strength(signals, permission)
+    currencies = strength["currency"].tolist()
+    matrix = build_pair_matrix(signals, currencies)
+
+    left, right = st.columns([0.95, 1.05])
     with left:
-        st.subheader("Passt die Marktphase zu den Daten?")
-        st.markdown('<div class="section-note">Je höher der Wert, desto besser passt das Regime zu Growth, Inflation, Policy und Risk.</div>', unsafe_allow_html=True)
-        if not alignment.empty and {"regime", "semantic_fit_score"}.issubset(alignment.columns):
-            plot_df = alignment.copy()
-            plot_df["Bewertung"] = plot_df.get("semantic_fit_label", "").map(friendly_fit)
-            fig = px.bar(
-                plot_df.sort_values("semantic_fit_score"),
-                x="semantic_fit_score",
-                y="regime",
-                color="Bewertung",
-                color_discrete_map={
-                    "Passt stark": "#22c55e",
-                    "Plausibel": "#84cc16",
-                    "Gemischt": "#f59e0b",
-                    "Passt nicht": "#ef4444",
-                },
-                orientation="h",
-                range_x=[0, 100],
-                labels={"semantic_fit_score": "Passung", "regime": "Marktphase"},
-            )
-            fig.update_layout(height=390, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            render_dataframe(alignment)
+        st.subheader("Currency Strength")
+        st.markdown('<div class="section-note">Relative Stärke aus aktuellen Macro-/Policy-Pair-Scores aggregiert. Grüne Währungen werden bevorzugt, rote eher gemieden.</div>', unsafe_allow_html=True)
+        plot_df = strength.copy()
+        fig = px.bar(
+            plot_df.sort_values("strength"),
+            x="strength",
+            y="currency",
+            color="read",
+            color_discrete_map={"Strong": "#22c55e", "Neutral": "#60a5fa", "Weak": "#ef4444"},
+            orientation="h",
+            hover_data=[col for col in ["data_quality", "permission", "ideas"] if col in plot_df.columns],
+            labels={"strength": "Relative strength", "currency": "Currency"},
+        )
+        fig.update_layout(height=440, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        st.subheader("Welche Modi sind aktiv?")
-        st.markdown('<div class="section-note">Das ist die Betriebsart des Dashboards: handeln, beobachten, forschen oder Daten verbessern.</div>', unsafe_allow_html=True)
-        if not strategy.empty and {"mode", "conviction"}.issubset(strategy.columns):
-            plot_df = strategy.copy()
-            plot_df["Modus"] = plot_df["mode"].map(friendly_mode)
-            plot_df["Status"] = plot_df.get("status", "").map(friendly_status)
+        st.subheader("Relative FX Bias")
+        st.markdown('<div class="section-note">Row currency stronger vs column currency when the cell is green.</div>', unsafe_allow_html=True)
+        fig = px.imshow(
+            matrix,
+            color_continuous_scale="RdYlGn",
+            zmid=0,
+            aspect="auto",
+            labels=dict(x="Against", y="Currency", color="Bias"),
+        )
+        fig.update_layout(height=440, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    bottom_left, bottom_right = st.columns([0.86, 1.14])
+    with bottom_left:
+        st.subheader("Regime Confidence")
+        if not calibrated.empty and {"regime", "calibrated_probability"}.issubset(calibrated.columns):
+            plot_df = calibrated.copy().sort_values("calibrated_probability", ascending=True)
             fig = px.bar(
-                plot_df.sort_values("conviction"),
-                x="conviction",
-                y="Modus",
-                color="Status",
-                color_discrete_map={
-                    "Aktiv": "#22c55e",
-                    "Beobachten": "#f59e0b",
-                    "Research": "#60a5fa",
-                    "Geschlossen": "#ef4444",
-                    "Aus": "#64748b",
-                },
+                plot_df,
+                x="calibrated_probability",
+                y="regime",
                 orientation="h",
-                range_x=[0, 100],
-                labels={"conviction": "Relevanz", "Modus": "Modus"},
+                color="is_scorecard_regime" if "is_scorecard_regime" in plot_df.columns else None,
+                color_discrete_map={True: "#22c55e", False: "#60a5fa"},
+                labels={"calibrated_probability": "Probability", "regime": "Regime"},
             )
-            fig.update_layout(height=390, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
+            fig.update_layout(height=320, xaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            render_dataframe(strategy)
+            st.info("No calibrated regime probabilities loaded.")
+    with bottom_right:
+        st.subheader("Top Pair Ideas")
+        st.markdown('<div class="section-note">Cards show research priority, not an automatic trade signal.</div>', unsafe_allow_html=True)
+        render_pair_cards(signals, limit=4)
 
-    st.subheader("Top Watchlist")
-    st.markdown('<div class="section-note">Das sind Beobachtungsideen. Wenn “Einsatz” nicht Baseline erlaubt sagt, ist es kein sauberes Live-Signal.</div>', unsafe_allow_html=True)
-    simple = simplified_signals(signals).head(6)
-    render_dataframe(simple, height=260)
-
-    with st.expander("Technische Details anzeigen"):
-        render_dataframe(regime, height=340)
+    with st.expander("Raw overview details"):
+        render_dataframe(regime, height=260)
 
 
-def watchlist_view(frames: Dict[str, pd.DataFrame]) -> None:
+def currencies_view(frames: Dict[str, pd.DataFrame]) -> None:
+    signals = sort_signal_board(get_frame(frames, "ensemble_signals"))
+    permission = get_frame(frames, "currency_permission")
+    strength = build_currency_strength(signals, permission)
+
+    st.subheader("Currencies")
+    st.markdown('<div class="section-note">Which currencies currently look strong, weak, clean or data-limited.</div>', unsafe_allow_html=True)
+
+    if not strength.empty:
+        fig = px.bar(
+            strength.sort_values("strength"),
+            x="strength",
+            y="currency",
+            color="read",
+            color_discrete_map={"Strong": "#22c55e", "Neutral": "#60a5fa", "Weak": "#ef4444"},
+            orientation="h",
+            hover_data=[col for col in ["data_quality", "policy_mode", "ideas"] if col in strength.columns],
+            labels={"strength": "Relative strength", "currency": "Currency"},
+        )
+        fig.update_layout(height=460, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
+
+    cards = []
+    for _, row in strength.iterrows():
+        quality = safe_text(row.get("data_quality", "n/a"))
+        tone = "good" if quality == "Good" else ("watch" if "stale" in quality.lower() or "rates" in quality.lower() else "info")
+        cards.append(
+            f"""
+            <div class="currency-card">
+                <div class="ccy">{esc(row.get("currency"))} · {row.get("strength", 0):.2f}</div>
+                <div class="line">Read: {esc(row.get("read"))}</div>
+                <div class="line">Data: <span class="pill pill-{tone}">{esc(quality)}</span></div>
+            </div>
+            """
+        )
+    st.markdown(f'<div class="currency-strip">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+    with st.expander("Currency data details"):
+        render_dataframe(permission, height=420)
+
+
+def pairs_view(frames: Dict[str, pd.DataFrame]) -> None:
     signals = sort_signal_board(get_frame(frames, "ensemble_signals"))
     if signals.empty:
-        st.info("Keine Watchlist-Daten geladen.")
+        st.info("No pair data loaded.")
         return
 
-    st.subheader("Watchlist")
-    st.markdown('<div class="section-note">Hier siehst du Pair-Ideen nach Nutzungsstatus. Beobachten heisst nicht automatisch handeln.</div>', unsafe_allow_html=True)
+    st.subheader("Pairs")
+    st.markdown('<div class="section-note">Macro-derived pair ideas ranked by current score and filtered by data quality and historical checks.</div>', unsafe_allow_html=True)
 
-    actions = sorted(signals["ensemble_action"].dropna().unique()) if "ensemble_action" in signals.columns else []
-    readable_options = {friendly_action(action): action for action in actions}
-    default_labels = [label for label in readable_options if label in ["Beobachten", "Nur Kontext"]]
-    selected_labels = st.multiselect("Status", list(readable_options.keys()), default=default_labels or list(readable_options.keys()))
-    selected_actions = [readable_options[label] for label in selected_labels]
+    filter_choice = st.radio(
+        "View",
+        ["All", "Watch only", "Context only", "Blocked"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    filtered = signals.copy()
+    if filter_choice == "Watch only" and "ensemble_action" in filtered.columns:
+        filtered = filtered[filtered["ensemble_action"].eq("Research watch only")]
+    elif filter_choice == "Context only" and "ensemble_action" in filtered.columns:
+        filtered = filtered[filtered["ensemble_action"].eq("Context watch")]
+    elif filter_choice == "Blocked" and "ensemble_action" in filtered.columns:
+        filtered = filtered[filtered["ensemble_action"].eq("Research / no action")]
 
-    filtered = signals
-    if selected_actions and "ensemble_action" in filtered.columns:
-        filtered = filtered[filtered["ensemble_action"].isin(selected_actions)]
-
-    left, right = st.columns([0.8, 1.4])
-    with left:
-        counts = (
-            filtered.get("ensemble_action", pd.Series(dtype=str))
-            .map(friendly_action)
-            .value_counts()
-            .rename_axis("Status")
-            .reset_index(name="Paare")
+    top = filtered.head(14).copy()
+    top["Status"] = frame_col(top, "ensemble_action").astype(str).map(friendly_action)
+    if {"pair", "ensemble_final_score"}.issubset(top.columns):
+        fig = px.bar(
+            top.sort_values("ensemble_final_score"),
+            x="ensemble_final_score",
+            y="pair",
+            color="Status",
+            orientation="h",
+            hover_data=[col for col in ["expression", "position_permission", "rates_oos_label", "cpi_oos_label"] if col in top.columns],
+            labels={"ensemble_final_score": "Current score", "pair": "Pair"},
         )
-        render_dataframe(counts, height=190)
-    with right:
-        if {"pair", "ensemble_final_score"}.issubset(filtered.columns):
-            plot_df = filtered.head(12).copy()
-            plot_df["Status"] = plot_df.get("ensemble_action", "").map(friendly_action)
-            fig = px.bar(
-                plot_df.sort_values("ensemble_final_score"),
-                x="ensemble_final_score",
-                y="pair",
-                color="Status",
-                text="expression" if "expression" in plot_df.columns else None,
-                orientation="h",
-                labels={"ensemble_final_score": "Score", "pair": "Pair"},
-            )
-            fig.update_layout(height=390, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
-            st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(height=470, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
+        st.plotly_chart(fig, use_container_width=True)
 
-    simple = simplified_signals(filtered)
-    render_dataframe(simple, height=420)
+    st.markdown("#### Top Cards")
+    render_pair_cards(filtered, limit=4)
 
-    with st.expander("Alle technischen Spalten anzeigen"):
+    with st.expander("Pair details"):
+        render_dataframe(simplified_signals(filtered), height=430)
+
+    with st.expander("Raw pair export"):
         render_dataframe(filtered, height=520)
 
 
-def market_phase_view(frames: Dict[str, pd.DataFrame]) -> None:
-    latest = get_frame(frames, "calibrated_latest")
-    comparison = get_frame(frames, "calibration_comparison")
+def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
+    regime = get_frame(frames, "ensemble_regime")
+    alignment = get_frame(frames, "ensemble_alignment")
     scores = get_frame(frames, "ensemble_scores")
+    calibrated = get_frame(frames, "calibrated_latest")
     prob_driver = get_frame(frames, "prob_driver")
 
-    st.subheader("Marktphase verstehen")
-    st.markdown('<div class="section-note">Diese Seite erklaert, warum das Dashboard die aktuelle Marktphase akzeptiert oder verwirft.</div>', unsafe_allow_html=True)
+    st.subheader("Regime")
+    st.markdown('<div class="section-note">Scorecard is the primary regime. Markov/Bayesian acts as second-opinion confidence and warning layer.</div>', unsafe_allow_html=True)
+
+    final_regime = lookup(regime, "Final regime read")
+    prob_top = lookup(regime, "Probabilistic top regime")
+    bayes_read = lookup(regime, "Bayesian read")
+    confidence = lookup(regime, "Final regime confidence")
+    cols = st.columns(3)
+    with cols[0]:
+        metric_card("Scorecard regime", final_regime, f"Confidence {confidence}/100", "good")
+    with cols[1]:
+        metric_card("Markov/Bayes view", prob_top, f"Second opinion: {friendly_bayes(bayes_read)}", "watch")
+    with cols[2]:
+        metric_card("Final use", "Confidence layer", "Does not override the baseline unless drivers confirm.", "info")
 
     left, right = st.columns([1.0, 1.0])
     with left:
-        st.markdown("#### Modell-Warnung vs geglättete Sicht")
-        if not latest.empty and {"regime", "raw_probability", "calibrated_probability"}.issubset(latest.columns):
-            plot_df = latest.melt(
-                id_vars=["regime"],
-                value_vars=["raw_probability", "calibrated_probability"],
-                var_name="Sicht",
-                value_name="Wahrscheinlichkeit",
-            )
-            plot_df["Sicht"] = plot_df["Sicht"].replace({"raw_probability": "Rohes Modell", "calibrated_probability": "Geglättet"})
+        st.markdown("#### Regime probabilities")
+        if not calibrated.empty and {"regime", "calibrated_probability"}.issubset(calibrated.columns):
+            plot_df = calibrated.copy().sort_values("calibrated_probability")
             fig = px.bar(
                 plot_df,
-                x="Wahrscheinlichkeit",
+                x="calibrated_probability",
                 y="regime",
-                color="Sicht",
-                barmode="group",
                 orientation="h",
-                labels={"regime": "Marktphase"},
+                color="is_scorecard_regime" if "is_scorecard_regime" in plot_df.columns else None,
+                color_discrete_map={True: "#22c55e", False: "#60a5fa"},
+                labels={"calibrated_probability": "Probability", "regime": "Regime"},
             )
-            fig.update_layout(height=390, xaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
+            fig.update_layout(height=420, xaxis_tickformat=".0%", margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
         else:
-            render_dataframe(latest)
-
+            render_dataframe(calibrated, height=320)
     with right:
-        st.markdown("#### Aktuelle Makro-Treiber")
+        st.markdown("#### Macro drivers")
         if not scores.empty and {"feature", "latest_score"}.issubset(scores.columns):
             plot_df = scores.copy()
-            plot_df["Treiber"] = plot_df["feature"].map(FIELD_LABELS).fillna(plot_df["feature"])
+            plot_df["Driver"] = plot_df["feature"].map(FIELD_LABELS).fillna(plot_df["feature"])
             fig = px.bar(
                 plot_df,
-                x="Treiber",
+                x="Driver",
                 y="latest_score",
-                color="Treiber",
+                color="Driver",
                 labels={"latest_score": "Score"},
             )
-            fig.update_layout(height=390, showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
+            fig.update_layout(height=420, showlegend=False, margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            render_dataframe(scores)
+            render_dataframe(scores, height=320)
 
-    st.markdown("#### Warum sagt das Modell das?")
-    driver = prob_driver.copy()
-    if not driver.empty:
-        driver = driver.rename(columns={
-            "feature": "Treiber",
-            "latest_score": "Aktueller Score",
-            "top_state_mapped_regime": "Modell-Regime",
-            "top_state_average": "Typischer Score im Modell-Regime",
-            "gap_to_state_average": "Abweichung",
-            "driver_read": "Lesart",
-        })
-        if "Treiber" in driver.columns:
-            driver["Treiber"] = driver["Treiber"].map(FIELD_LABELS).fillna(driver["Treiber"])
-    render_dataframe(driver, height=300)
-
-    with st.expander("Rohdaten zum Modellvergleich anzeigen"):
-        render_dataframe(comparison, height=240)
-
-
-def history_view(frames: Dict[str, pd.DataFrame]) -> None:
-    baseline = get_frame(frames, "final_baseline")
-    split = get_frame(frames, "final_split")
-
-    st.subheader("Historie & Vertrauen")
-    st.markdown('<div class="section-note">Hier geht es um die Frage: Welche Strategie-Varianten waren historisch robust genug?</div>', unsafe_allow_html=True)
-
-    if not baseline.empty and {"strategy", "annualized_return", "oos_annualized_return"}.issubset(baseline.columns):
-        top = baseline.head(16).copy()
-        plot_df = top.melt(
-            id_vars=["strategy", "family", "horizon"] if {"family", "horizon"}.issubset(top.columns) else ["strategy"],
-            value_vars=[c for c in ["annualized_return", "oos_annualized_return"] if c in top.columns],
-            var_name="Zeitraum",
-            value_name="Rendite",
-        )
-        plot_df["Zeitraum"] = plot_df["Zeitraum"].replace({"annualized_return": "Gesamt", "oos_annualized_return": "Out-of-sample"})
+    st.markdown("#### Regime fit")
+    if not alignment.empty and {"regime", "semantic_fit_score"}.issubset(alignment.columns):
+        plot_df = alignment.copy()
+        plot_df["Fit"] = frame_col(plot_df, "semantic_fit_label").astype(str).map(friendly_fit)
         fig = px.bar(
-            plot_df,
-            x="strategy",
-            y="Rendite",
-            color="Zeitraum",
-            facet_col="horizon" if "horizon" in plot_df.columns else None,
-            labels={"strategy": "Strategie"},
+            plot_df.sort_values("semantic_fit_score"),
+            x="semantic_fit_score",
+            y="regime",
+            color="Fit",
+            orientation="h",
+            range_x=[0, 100],
+            labels={"semantic_fit_score": "Fit", "regime": "Regime"},
         )
-        fig.update_layout(height=430, yaxis_tickformat=".1%", margin=dict(l=10, r=10, t=20, b=80), legend_title_text="")
+        fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), legend_title_text="")
         st.plotly_chart(fig, use_container_width=True)
 
-    display_baseline = baseline.rename(columns={
-        "family": "Familie",
-        "strategy": "Strategie",
-        "horizon": "Horizont",
-        "annualized_return": "Rendite p.a.",
-        "oos_annualized_return": "OOS Rendite p.a.",
-        "sharpe_proxy": "Sharpe Proxy",
-        "max_drawdown": "Max Drawdown",
-        "baseline_decision": "Entscheidung",
-        "decision_note": "Kommentar",
-    })
-    render_dataframe(display_baseline, height=430)
-
-    with st.expander("Split-Auswertung anzeigen"):
-        render_dataframe(split, height=430)
+    with st.expander("Driver details"):
+        render_dataframe(prob_driver, height=330)
 
 
 def data_quality_view(frames: Dict[str, pd.DataFrame]) -> None:
@@ -743,78 +978,81 @@ def data_quality_view(frames: Dict[str, pd.DataFrame]) -> None:
     freshness = get_frame(frames, "source_freshness")
     readiness = get_frame(frames, "source_readiness")
 
-    st.subheader("Datenqualität")
-    st.markdown('<div class="section-note">Diese Seite zeigt, welche Daten sauber genug sind und welche Signale deshalb blockiert werden.</div>', unsafe_allow_html=True)
+    st.subheader("Data Quality")
+    st.markdown('<div class="section-note">The dashboard uses the newest available observations. If data is stale, that currency is downgraded or blocked.</div>', unsafe_allow_html=True)
 
-    left, right = st.columns([1.0, 1.0])
-    with left:
-        st.markdown("#### Welche Währungen sind sauber?")
-        display_permission = permission.rename(columns={
-            "currency": "Währung",
-            "rates_fresh": "Zinsen frisch",
-            "cpi_fresh": "Inflation frisch",
-            "data_quality": "Datenstatus",
-            "permission": "Nutzung",
-            "policy_mode": "Policy-Modus",
-        })
-        render_dataframe(display_permission, height=370)
-    with right:
-        st.markdown("#### Quellenstatus")
-        display_readiness = readiness.rename(columns={
-            "currency": "Währung",
-            "field": "Datenfeld",
-            "primary_source": "Quelle",
-            "implementation_status": "Status",
-            "readiness": "Bereit?",
-            "notes": "Notiz",
-        })
-        render_dataframe(display_readiness, height=370)
+    clean, total = clean_currency_count(permission)
+    stale_count = max(total - clean, 0)
+    cols = st.columns(3)
+    with cols[0]:
+        metric_card("Clean real-rate currencies", f"{clean}/{total}", "Full policy stack allowed.", "good" if clean else "watch")
+    with cols[1]:
+        metric_card("Rates-only / limited", str(stale_count), "Usable as context, not clean real-rate signal.", "watch")
+    with cols[2]:
+        missing_keys = int(to_bool_series(readiness["api_key_required"]).sum()) if not readiness.empty and "api_key_required" in readiness.columns else 0
+        metric_card("API/key dependent", str(missing_keys), "Future upgrades for cleaner data.", "info")
 
-    st.markdown("#### Frische der Daten")
+    st.markdown("#### Freshness by currency")
     if not freshness.empty and {"currency", "field", "is_current_fresh"}.issubset(freshness.columns):
         plot_df = freshness.copy()
-        plot_df["Daten frisch?"] = plot_df["is_current_fresh"].map({True: "Frisch", False: "Veraltet"}).fillna(plot_df["is_current_fresh"].astype(str))
+        plot_df["Fresh"] = to_bool_series(plot_df["is_current_fresh"]).map({True: "Fresh", False: "Stale"})
         fig = px.histogram(
             plot_df,
             x="currency",
-            color="Daten frisch?",
+            color="Fresh",
             facet_col="field",
-            labels={"currency": "Währung", "count": "Anzahl"},
+            color_discrete_map={"Fresh": "#22c55e", "Stale": "#ef4444"},
+            labels={"currency": "Currency", "count": "Fields"},
         )
         fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), legend_title_text="")
         st.plotly_chart(fig, use_container_width=True)
-    render_dataframe(freshness, height=430)
+
+    st.markdown("#### What needs fixing")
+    if not freshness.empty:
+        needs = freshness.copy()
+        if "is_current_fresh" in needs.columns:
+            needs = needs[~to_bool_series(needs["is_current_fresh"])]
+        show_cols = [col for col in ["currency", "field", "current_latest", "current_age_days", "primary_source", "access", "api_key_required", "priority", "notes"] if col in needs.columns]
+        if show_cols:
+            render_dataframe(needs[show_cols], height=260)
+        else:
+            st.success("No stale source rows found.")
+
+    with st.expander("Source readiness details"):
+        render_dataframe(readiness, height=440)
+    with st.expander("Currency permission details"):
+        render_dataframe(permission, height=340)
 
 
 def main() -> None:
     inject_css()
     st.sidebar.title("Macro FX")
-    st.sidebar.caption("1. Colab v1.3.1 ausführen. 2. ZIP hier hochladen.")
+    st.sidebar.caption("Upload the ZIP exported by Colab v1.3.1.")
     frames = load_frames()
     missing_files_panel(frames)
 
     st.title("Macro FX Cockpit")
     st.markdown(
-        f'<div class="subtle">{APP_VERSION} · Einfacher Überblick für Marktphase, Watchlist, Historie und Datenqualität.</div>',
+        f'<div class="subtle">{APP_VERSION} · Regime, currency strength, relative FX bias and data quality.</div>',
         unsafe_allow_html=True,
     )
 
     if not frames:
-        st.warning("Bitte lade links die ZIP-Datei aus Colab hoch.")
+        st.warning("Upload the ZIP file from the final Colab export in the left sidebar.")
         st.stop()
 
-    tab_today, tab_watchlist, tab_market, tab_history, tab_data = st.tabs(
-        ["Heute", "Watchlist", "Marktphase", "Historie", "Datenqualität"]
+    tab_overview, tab_currencies, tab_pairs, tab_regime, tab_data = st.tabs(
+        ["Overview", "Currencies", "Pairs", "Regime", "Data Quality"]
     )
 
-    with tab_today:
-        today_view(frames)
-    with tab_watchlist:
-        watchlist_view(frames)
-    with tab_market:
-        market_phase_view(frames)
-    with tab_history:
-        history_view(frames)
+    with tab_overview:
+        overview_view(frames)
+    with tab_currencies:
+        currencies_view(frames)
+    with tab_pairs:
+        pairs_view(frames)
+    with tab_regime:
+        regime_view(frames)
     with tab_data:
         data_quality_view(frames)
 
