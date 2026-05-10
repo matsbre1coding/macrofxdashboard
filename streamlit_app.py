@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.7 Research Cockpit"
+APP_VERSION = "v1.7.1 Research Cockpit"
 
 
 st.set_page_config(
@@ -1115,6 +1115,26 @@ def build_pair_matrix(signals: pd.DataFrame, currencies: list[str]) -> pd.DataFr
     return matrix.round(2)
 
 
+def build_pair_hover_text(matrix: pd.DataFrame) -> pd.DataFrame:
+    hover = pd.DataFrame("", index=matrix.index, columns=matrix.columns)
+    for row_currency in matrix.index:
+        for column_currency in matrix.columns:
+            value = to_float(matrix.loc[row_currency, column_currency])
+            if value > 0:
+                direction = f"Long {row_currency} / Short {column_currency}"
+            elif value < 0:
+                direction = f"Long {column_currency} / Short {row_currency}"
+            else:
+                direction = "No directional edge"
+            hover.loc[row_currency, column_currency] = (
+                f"{direction}<br>"
+                f"Signed bias: {value:+.2f}<br>"
+                f"Absolute bias: {abs(value):.2f}<br>"
+                "Source: signal-implied pair board"
+            )
+    return hover
+
+
 def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
     if signals.empty:
         return signals
@@ -1245,6 +1265,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
     strength = build_currency_strength(signals, permission)
     currencies = strength["currency"].tolist()
     matrix = build_pair_matrix(signals, currencies)
+    hover_text = build_pair_hover_text(matrix)
 
     left, right = st.columns([0.95, 1.05])
     with left:
@@ -1270,16 +1291,17 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     with right:
         st.subheader("Relative FX Bias")
-        st.markdown('<div class="section-note">Green means row currency is favored over column currency. This visualizes the exported pair ideas; it is not a new model calculation.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-note">Green means row currency is favored over column currency. Red means column currency is favored over row currency. This visualizes the exported pair ideas; it is not a new model calculation.</div>', unsafe_allow_html=True)
         fig = go.Figure(
             data=go.Heatmap(
                 z=matrix.values,
                 x=matrix.columns,
                 y=matrix.index,
+                customdata=hover_text.values,
                 colorscale="RdYlGn",
                 zmid=0,
                 colorbar=dict(title="Bias"),
-                hovertemplate="Long %{y} / Short %{x}<br>Bias %{z:.2f}<extra></extra>",
+                hovertemplate="%{customdata}<extra></extra>",
             )
         )
         fig.update_xaxes(title="Against")
