@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import io
 import html
+import json
 import os
 import re
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Dict
 
@@ -14,7 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.7.1 Research Cockpit"
+APP_VERSION = "v1.8 Research Cockpit"
 
 
 st.set_page_config(
@@ -39,6 +44,32 @@ CSV_FILES = {
     "source_freshness": "macro_fx_source_freshness_audit.csv",
     "source_readiness": "macro_fx_primary_source_readiness.csv",
 }
+
+
+NARRATIVE_FILE_NAMES = {
+    "narrative_monitor.csv",
+    "macro_fx_public_narrative_monitor.csv",
+    "narrative_monitor.json",
+    "macro_fx_public_narrative_monitor.json",
+}
+
+
+NARRATIVE_COLUMNS = [
+    "currency",
+    "source_name",
+    "source_type",
+    "title",
+    "url",
+    "published_at",
+    "summary",
+    "sentiment",
+    "confidence",
+    "relevance",
+    "themes",
+    "supports",
+    "risks",
+    "reason",
+]
 
 
 FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
@@ -209,6 +240,30 @@ REGIME_FX_IMPLICATIONS = {
         "Avoid treating one currency as structurally strong or weak from the backdrop alone.",
     ],
 }
+
+
+PUBLIC_NARRATIVE_SOURCE_REGISTRY = [
+    {"source_name": "Federal Reserve", "source_type": "Central bank", "coverage": "USD", "url": "https://www.federalreserve.gov/newsevents.htm", "feed_url": "https://www.federalreserve.gov/feeds/press_all.xml", "fetch_enabled": True},
+    {"source_name": "Federal Reserve speeches", "source_type": "Central bank", "coverage": "USD", "url": "https://www.federalreserve.gov/newsevents/speeches.htm", "feed_url": "https://www.federalreserve.gov/feeds/speeches.xml", "fetch_enabled": True},
+    {"source_name": "European Central Bank", "source_type": "Central bank", "coverage": "EUR", "url": "https://www.ecb.europa.eu/press/html/index.en.html", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Bank of England", "source_type": "Central bank", "coverage": "GBP", "url": "https://www.bankofengland.co.uk/news", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Bank of Japan", "source_type": "Central bank", "coverage": "JPY", "url": "https://www.boj.or.jp/en/about/press/index.htm", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Swiss National Bank", "source_type": "Central bank", "coverage": "CHF", "url": "https://www.snb.ch/en/the-snb/mandates-goals/statistics", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Bank of Canada", "source_type": "Central bank", "coverage": "CAD", "url": "https://www.bankofcanada.ca/publications/", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Reserve Bank of Australia", "source_type": "Central bank", "coverage": "AUD", "url": "https://www.rba.gov.au/media-releases/", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Reserve Bank of New Zealand", "source_type": "Central bank", "coverage": "NZD", "url": "https://www.rbnz.govt.nz/news-and-events", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "BIS speeches", "source_type": "Official macro commentary", "coverage": "Global", "url": "https://www.bis.org/list/cbspeeches/index.htm", "feed_url": "https://www.bis.org/doclist/cbspeeches.rss", "fetch_enabled": True},
+    {"source_name": "IMF Blog", "source_type": "Official macro commentary", "coverage": "Global", "url": "https://www.imf.org/en/Blogs", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "OECD Economic Outlook", "source_type": "Official macro commentary", "coverage": "Global", "url": "https://www.oecd.org/economic-outlook/", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "World Bank Blogs", "source_type": "Official macro commentary", "coverage": "Global", "url": "https://blogs.worldbank.org/", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "New York Fed Liberty Street Economics", "source_type": "Public research blog", "coverage": "USD", "url": "https://libertystreeteconomics.newyorkfed.org/", "feed_url": "https://libertystreeteconomics.newyorkfed.org/feed/", "fetch_enabled": True},
+    {"source_name": "Dallas Fed Economics", "source_type": "Public research blog", "coverage": "USD", "url": "https://www.dallasfed.org/research/economics", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Cleveland Fed Economic Commentary", "source_type": "Public research blog", "coverage": "USD", "url": "https://www.clevelandfed.org/publications/economic-commentary", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "BlackRock Market Insights", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://www.blackrock.com/corporate/insights", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "Vanguard Market Perspectives", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://corporate.vanguard.com/content/corporatesite/us/en/corp/articles/market-perspectives.html", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "PIMCO Insights", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://www.pimco.com/en-us/insights", "feed_url": "", "fetch_enabled": False},
+    {"source_name": "State Street Global Markets Insights", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://www.statestreet.com/us/en/asset-manager/insights", "feed_url": "", "fetch_enabled": False},
+]
 
 
 def inject_css() -> None:
@@ -417,6 +472,51 @@ def inject_css() -> None:
             font-size: 0.8rem;
             margin-top: 4px;
         }
+        .narrative-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin: 12px 0 18px 0;
+        }
+        .narrative-card {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 8px;
+            padding: 13px 14px;
+            background: rgba(15, 23, 42, 0.62);
+            min-height: 220px;
+        }
+        .narrative-card .ccy {
+            color: #f8fafc;
+            font-size: 1.15rem;
+            font-weight: 780;
+            margin-bottom: 4px;
+        }
+        .narrative-card .sentiment {
+            color: #f8fafc;
+            font-size: 1.02rem;
+            font-weight: 740;
+            margin-bottom: 8px;
+        }
+        .narrative-card .line {
+            color: #cbd5e1;
+            font-size: 0.8rem;
+            line-height: 1.34;
+            margin-top: 4px;
+        }
+        .narrative-card .label {
+            color: #94a3b8;
+            font-size: 0.68rem;
+            font-weight: 760;
+            text-transform: uppercase;
+            margin-top: 8px;
+        }
+        .narrative-card .mini {
+            color: #94a3b8;
+            font-size: 0.75rem;
+            line-height: 1.3;
+        }
+        .tone-neutral { border-left: 5px solid #64748b; }
+        .tone-mixed { border-left: 5px solid #d99a00; }
         .status-grid {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -517,6 +617,7 @@ def inject_css() -> None:
             .mini-grid,
             .pair-grid,
             .currency-strip,
+            .narrative-grid,
             .status-grid {
                 grid-template-columns: 1fr;
             }
@@ -568,6 +669,25 @@ def read_csv_path(path: str) -> pd.DataFrame:
     return normalize_frame(pd.read_csv(path))
 
 
+@st.cache_data(show_spinner=False)
+def read_json_bytes(data: bytes) -> pd.DataFrame:
+    payload = json.loads(data.decode("utf-8-sig"))
+    if isinstance(payload, dict):
+        if isinstance(payload.get("items"), list):
+            payload = payload["items"]
+        elif isinstance(payload.get("data"), list):
+            payload = payload["data"]
+        else:
+            payload = [payload]
+    return normalize_frame(pd.DataFrame(payload))
+
+
+@st.cache_data(show_spinner=False)
+def read_json_path(path: str) -> pd.DataFrame:
+    with open(path, "rb") as handle:
+        return read_json_bytes(handle.read())
+
+
 def discover_local_csvs(data_dir: Path) -> Dict[str, Path]:
     search_dirs = [data_dir, Path.cwd() / "data", Path.cwd()]
     found: Dict[str, Path] = {}
@@ -581,12 +701,30 @@ def discover_local_csvs(data_dir: Path) -> Dict[str, Path]:
     return found
 
 
+def discover_local_narrative(data_dir: Path) -> Path | None:
+    search_dirs = [data_dir, Path.cwd() / "data", Path.cwd()]
+    for folder in search_dirs:
+        if not folder.exists():
+            continue
+        for filename in NARRATIVE_FILE_NAMES:
+            candidate = folder / filename
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def read_narrative_payload(name: str, payload: bytes) -> pd.DataFrame:
+    if name.lower().endswith(".json"):
+        return read_json_bytes(payload)
+    return read_csv_bytes(payload)
+
+
 def parse_uploaded_files() -> Dict[str, pd.DataFrame]:
     uploads = st.sidebar.file_uploader(
         "Colab-ZIP hochladen",
-        type=["csv", "zip"],
+        type=["csv", "zip", "json"],
         accept_multiple_files=True,
-        help="Nimm die ZIP-Datei aus dem letzten Colab-Abschnitt Web-App ZIP Export.",
+        help="Nimm die ZIP-Datei aus dem letzten Colab-Abschnitt Web-App ZIP Export. Optional auch narrative_monitor.csv/json.",
     )
     frames: Dict[str, pd.DataFrame] = {}
     if not uploads:
@@ -603,10 +741,15 @@ def parse_uploaded_files() -> Dict[str, pd.DataFrame]:
                     key = filename_to_key.get(base)
                     if key:
                         frames[key] = read_csv_bytes(zf.read(member))
+                    elif base in NARRATIVE_FILE_NAMES:
+                        frames["narrative_monitor"] = read_narrative_payload(base, zf.read(member))
         else:
-            key = filename_to_key.get(Path(name).name)
+            base = Path(name).name
+            key = filename_to_key.get(base)
             if key:
                 frames[key] = read_csv_bytes(payload)
+            elif base in NARRATIVE_FILE_NAMES:
+                frames["narrative_monitor"] = read_narrative_payload(base, payload)
     return frames
 
 
@@ -614,6 +757,12 @@ def load_frames() -> Dict[str, pd.DataFrame]:
     data_dir = Path(os.getenv("MACRO_FX_DATA_DIR", "data"))
     local_paths = discover_local_csvs(data_dir)
     frames = {key: read_csv_path(str(path)) for key, path in local_paths.items()}
+    narrative_path = discover_local_narrative(data_dir)
+    if narrative_path is not None:
+        if narrative_path.suffix.lower() == ".json":
+            frames["narrative_monitor"] = read_json_path(str(narrative_path))
+        else:
+            frames["narrative_monitor"] = read_csv_path(str(narrative_path))
     frames.update(parse_uploaded_files())
     return frames
 
@@ -837,7 +986,7 @@ def safe_text(value: object, default: str = "n/a") -> str:
     try:
         if pd.isna(value):
             return default
-    except TypeError:
+    except (TypeError, ValueError):
         pass
     return str(value)
 
@@ -1133,6 +1282,379 @@ def build_pair_hover_text(matrix: pd.DataFrame) -> pd.DataFrame:
                 "Source: signal-implied pair board"
             )
     return hover
+
+
+def extract_currencies(value: object) -> list[str]:
+    text = safe_text(value, "").upper()
+    found = []
+    for currency in FX_CURRENCIES:
+        if re.search(rf"\b{currency}\b", text):
+            found.append(currency)
+    return found
+
+
+def normalize_label(value: object, allowed: set[str], default: str) -> str:
+    text = safe_text(value, default).strip()
+    if not text:
+        return default
+    for label in allowed:
+        if text.lower() == label.lower():
+            return label
+    return default
+
+
+def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS)
+    out = frame.copy()
+    out.columns = [str(column).strip().lower() for column in out.columns]
+    for column in NARRATIVE_COLUMNS:
+        if column not in out.columns:
+            out[column] = ""
+    out["currency"] = out["currency"].astype(str).str.upper().str.strip()
+
+    exploded_rows = []
+    for _, row in out.iterrows():
+        currencies = extract_currencies(row.get("currency", ""))
+        if not currencies and "detected_currencies" in out.columns:
+            currencies = extract_currencies(row.get("detected_currencies", ""))
+        for currency in currencies:
+            if currency in FX_CURRENCIES:
+                clone = row.copy()
+                clone["currency"] = currency
+                exploded_rows.append(clone)
+    if not exploded_rows:
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS)
+
+    out = pd.DataFrame(exploded_rows)
+    out = out[NARRATIVE_COLUMNS].copy()
+    out["sentiment"] = out["sentiment"].apply(lambda value: normalize_label(value, {"Bullish", "Bearish", "Neutral", "Mixed"}, "Neutral"))
+    out["confidence"] = out["confidence"].apply(lambda value: normalize_label(value, {"Low", "Medium", "High"}, "Low"))
+    out["relevance"] = out["relevance"].apply(
+        lambda value: normalize_label(
+            value,
+            {"Currency-specific", "Direct macro-policy relevance", "General market commentary", "Weak mention"},
+            "General market commentary",
+        )
+    )
+    out["published_dt"] = pd.to_datetime(out["published_at"], errors="coerce", utc=True)
+    out["dedupe_key"] = (
+        out["url"].astype(str).str.strip().str.lower()
+        + "|"
+        + out["title"].astype(str).str.strip().str.lower()
+        + "|"
+        + out["currency"].astype(str)
+    )
+    out = out.drop_duplicates("dedupe_key").drop(columns=["dedupe_key"])
+    return out
+
+
+def narrative_age_days(value: object) -> float:
+    if value is None or pd.isna(value):
+        return 999.0
+    published = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(published):
+        return 999.0
+    return max((pd.Timestamp.now(tz="UTC") - published).total_seconds() / 86400.0, 0.0)
+
+
+def narrative_freshness_weight(age_days: float) -> float:
+    if age_days <= 2:
+        return 1.25
+    if age_days <= 7:
+        return 1.0
+    if age_days <= 14:
+        return 0.7
+    return 0.4
+
+
+def narrative_weighted_score(row: pd.Series) -> float:
+    sentiment_weight = {"Bullish": 1.0, "Bearish": -1.0, "Neutral": 0.0, "Mixed": 0.0}.get(safe_text(row.get("sentiment")), 0.0)
+    confidence_weight = {"Low": 0.5, "Medium": 1.0, "High": 1.5}.get(safe_text(row.get("confidence")), 0.5)
+    relevance_weight = {
+        "Currency-specific": 1.3,
+        "Direct macro-policy relevance": 1.0,
+        "General market commentary": 0.8,
+        "Weak mention": 0.4,
+    }.get(safe_text(row.get("relevance")), 0.8)
+    freshness_weight = narrative_freshness_weight(to_float(row.get("age_days"), 999.0))
+    return sentiment_weight * confidence_weight * freshness_weight * relevance_weight
+
+
+def split_theme_tokens(values: pd.Series) -> list[str]:
+    tokens: list[str] = []
+    for value in values.dropna().astype(str):
+        for token in re.split(r"[;,|]", value):
+            clean = token.strip()
+            if clean:
+                tokens.append(clean)
+    return tokens
+
+
+def top_texts(rows: pd.DataFrame, columns: list[str], limit: int = 2) -> str:
+    snippets = []
+    for _, row in rows.iterrows():
+        for column in columns:
+            text = safe_text(row.get(column, ""), "")
+            if text and text not in snippets:
+                snippets.append(shorten(text, 110))
+                break
+        if len(snippets) >= limit:
+            break
+    return " | ".join(snippets) if snippets else "n/a"
+
+
+def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    details = normalize_narrative_frame(narrative)
+    if details.empty:
+        empty_summary = pd.DataFrame(
+            {
+                "currency": sorted(FX_CURRENCIES),
+                "sentiment": "Not enough data",
+                "confidence": "Low",
+                "weighted_score": 0.0,
+                "bullish_sources": 0,
+                "bearish_sources": 0,
+                "neutral_mixed_sources": 0,
+                "latest_source_date": "n/a",
+                "source_count": 0,
+                "main_themes": "n/a",
+                "supporting_arguments": "n/a",
+                "opposing_arguments": "n/a",
+                "narrative_vs_dashboard": "Not enough data",
+            }
+        )
+        return empty_summary, details
+
+    details = details.copy()
+    details["age_days"] = details["published_dt"].apply(narrative_age_days)
+    details["weighted_source_score"] = details.apply(narrative_weighted_score, axis=1).round(3)
+
+    strength_map = {}
+    if not strength.empty and {"currency", "strength"}.issubset(strength.columns):
+        strength_map = dict(zip(strength["currency"].astype(str).str.upper(), pd.to_numeric(strength["strength"], errors="coerce").fillna(0.0)))
+
+    summary_rows = []
+    for currency in sorted(FX_CURRENCIES):
+        rows = details[details["currency"].eq(currency)].copy()
+        fresh_rows = rows[rows["age_days"].le(14)]
+        working = fresh_rows if not fresh_rows.empty else rows
+        source_count = int(len(working))
+        fresh_count = int(len(fresh_rows))
+        bullish_sources = int(working["sentiment"].eq("Bullish").sum())
+        bearish_sources = int(working["sentiment"].eq("Bearish").sum())
+        neutral_mixed_sources = int(working["sentiment"].isin(["Neutral", "Mixed"]).sum())
+        weighted_score = float(working["weighted_source_score"].sum()) if not working.empty else 0.0
+        bull_weight = float(working.loc[working["weighted_source_score"] > 0, "weighted_source_score"].sum()) if not working.empty else 0.0
+        bear_weight = abs(float(working.loc[working["weighted_source_score"] < 0, "weighted_source_score"].sum())) if not working.empty else 0.0
+        contradiction = bull_weight > 0.75 and bear_weight > 0.75 and min(bull_weight, bear_weight) / max(bull_weight, bear_weight) > 0.35
+
+        if source_count < 2 or fresh_count < 2:
+            sentiment = "Not enough data"
+        elif contradiction:
+            sentiment = "Mixed"
+        elif weighted_score >= 1.5:
+            sentiment = "Bullish"
+        elif weighted_score <= -1.5:
+            sentiment = "Bearish"
+        elif bullish_sources or bearish_sources:
+            sentiment = "Mixed"
+        else:
+            sentiment = "Neutral"
+
+        if sentiment == "Not enough data":
+            confidence = "Low"
+        elif abs(weighted_score) >= 2.5 and fresh_count >= 4 and not contradiction:
+            confidence = "High"
+        elif abs(weighted_score) >= 1.0 and fresh_count >= 2:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        strength_value = strength_map.get(currency, 0.0)
+        if sentiment == "Bullish" and strength_value > 0.25:
+            narrative_vs_dashboard = "Supports dashboard"
+        elif sentiment == "Bearish" and strength_value < -0.25:
+            narrative_vs_dashboard = "Supports dashboard"
+        elif sentiment == "Bullish" and strength_value < -0.25:
+            narrative_vs_dashboard = "Conflicts with dashboard"
+        elif sentiment == "Bearish" and strength_value > 0.25:
+            narrative_vs_dashboard = "Conflicts with dashboard"
+        else:
+            narrative_vs_dashboard = "Not enough data"
+
+        themes = split_theme_tokens(working["themes"]) if not working.empty else []
+        top_themes = pd.Series(themes).value_counts().head(4).index.tolist() if themes else []
+        latest_date = "n/a"
+        if not working.empty and working["published_dt"].notna().any():
+            latest_date = str(working["published_dt"].max().date())
+
+        summary_rows.append(
+            {
+                "currency": currency,
+                "sentiment": sentiment,
+                "confidence": confidence,
+                "weighted_score": round(weighted_score, 2),
+                "bullish_sources": bullish_sources,
+                "bearish_sources": bearish_sources,
+                "neutral_mixed_sources": neutral_mixed_sources,
+                "latest_source_date": latest_date,
+                "source_count": source_count,
+                "main_themes": ", ".join(top_themes) if top_themes else "n/a",
+                "supporting_arguments": top_texts(working[working["weighted_source_score"] > 0].sort_values("weighted_source_score", ascending=False), ["supports", "summary", "reason"]),
+                "opposing_arguments": top_texts(working[working["weighted_source_score"] < 0].sort_values("weighted_source_score"), ["risks", "summary", "reason"]),
+                "narrative_vs_dashboard": narrative_vs_dashboard,
+            }
+        )
+
+    return pd.DataFrame(summary_rows), details
+
+
+def narrative_tone(sentiment: str) -> str:
+    if sentiment == "Bullish":
+        return "good"
+    if sentiment == "Bearish":
+        return "bad"
+    if sentiment == "Mixed":
+        return "mixed"
+    if sentiment == "Neutral":
+        return "neutral"
+    return "info"
+
+
+def classify_public_item(source: dict, title: str, summary: str, published_at: str, url: str) -> list[dict]:
+    text = f"{title} {summary}".lower()
+    currency_terms = {
+        "USD": ["usd", "dollar", "fed", "treasury", "us rates", "fomc"],
+        "EUR": ["eur", "euro", "ecb", "euro area"],
+        "GBP": ["gbp", "sterling", "pound", "boe", "uk"],
+        "JPY": ["jpy", "yen", "boj", "japan"],
+        "CHF": ["chf", "franc", "snb", "switzerland"],
+        "CAD": ["cad", "canadian dollar", "boc", "canada"],
+        "AUD": ["aud", "australian dollar", "rba", "australia"],
+        "NZD": ["nzd", "new zealand dollar", "rbnz", "new zealand"],
+    }
+    detected = [currency for currency, terms in currency_terms.items() if any(term in text for term in terms)]
+    coverage = safe_text(source.get("coverage", "")).upper()
+    if not detected and coverage in FX_CURRENCIES:
+        detected = [coverage]
+    if not detected:
+        return []
+
+    bullish_terms = ["stronger", "strength", "hawkish", "tightening", "higher rates", "sticky inflation", "resilient growth", "safe haven demand"]
+    bearish_terms = ["weaker", "weakness", "dovish", "rate cuts", "lower rates", "slowdown", "recession", "risk appetite improves", "easing"]
+    bullish_hits = sum(term in text for term in bullish_terms)
+    bearish_hits = sum(term in text for term in bearish_terms)
+    if bullish_hits and bearish_hits:
+        sentiment = "Mixed"
+    elif bullish_hits:
+        sentiment = "Bullish"
+    elif bearish_hits:
+        sentiment = "Bearish"
+    else:
+        sentiment = "Neutral"
+
+    source_type = safe_text(source.get("source_type", "Public commentary"))
+    relevance = "Direct macro-policy relevance" if "Central bank" in source_type or "Official" in source_type else "General market commentary"
+    confidence = "Medium" if sentiment in ["Bullish", "Bearish"] and relevance != "General market commentary" else "Low"
+    return [
+        {
+            "currency": currency,
+            "source_name": source.get("source_name", "Unknown source"),
+            "source_type": source_type,
+            "title": title,
+            "url": url,
+            "published_at": published_at,
+            "summary": shorten(summary, 260),
+            "sentiment": sentiment,
+            "confidence": confidence,
+            "relevance": relevance,
+            "themes": "public commentary",
+            "supports": "",
+            "risks": "",
+            "reason": "Simple keyword-based public-source MVP classification. Treat as research context only.",
+        }
+        for currency in detected
+    ]
+
+
+def clean_feed_text(value: object) -> str:
+    text = safe_text(value, "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_feed_date(value: object) -> str:
+    text = safe_text(value, "")
+    if not text:
+        return ""
+    try:
+        return parsedate_to_datetime(text).isoformat()
+    except Exception:
+        parsed = pd.to_datetime(text, errors="coerce", utc=True)
+        return "" if pd.isna(parsed) else parsed.isoformat()
+
+
+def fetch_feed_items(source: dict, per_source_limit: int = 6) -> list[dict]:
+    feed_url = safe_text(source.get("feed_url", ""), "")
+    if not feed_url:
+        return []
+    request = urllib.request.Request(feed_url, headers={"User-Agent": "MacroFXCockpitPublicNarrativeMonitor/1.0"})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        payload = response.read()
+    root = ET.fromstring(payload)
+    items = root.findall(".//item")
+    if not items:
+        items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+    rows = []
+    for item in items[:per_source_limit]:
+        title = clean_feed_text(item.findtext("title") or item.findtext("{http://www.w3.org/2005/Atom}title"))
+        summary = clean_feed_text(
+            item.findtext("description")
+            or item.findtext("summary")
+            or item.findtext("{http://www.w3.org/2005/Atom}summary")
+            or ""
+        )
+        link = clean_feed_text(item.findtext("link") or "")
+        atom_link = item.find("{http://www.w3.org/2005/Atom}link")
+        if not link and atom_link is not None:
+            link = atom_link.attrib.get("href", "")
+        published_at = parse_feed_date(
+            item.findtext("pubDate")
+            or item.findtext("published")
+            or item.findtext("updated")
+            or item.findtext("{http://www.w3.org/2005/Atom}published")
+            or item.findtext("{http://www.w3.org/2005/Atom}updated")
+        )
+        rows.extend(classify_public_item(source, title, summary, published_at, link or safe_text(source.get("url", ""))))
+    return rows
+
+
+@st.cache_data(ttl=14400, show_spinner=False)
+def fetch_public_narratives(refresh_token: int) -> tuple[pd.DataFrame, list[dict], str]:
+    rows = []
+    failures = []
+    for source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
+        if not source.get("fetch_enabled"):
+            continue
+        try:
+            rows.extend(fetch_feed_items(source, per_source_limit=6))
+        except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError, TimeoutError, OSError) as exc:
+            failures.append(
+                {
+                    "source_name": source.get("source_name", "Unknown source"),
+                    "source_type": source.get("source_type", ""),
+                    "url": source.get("feed_url") or source.get("url"),
+                    "error": shorten(str(exc), 180),
+                }
+            )
+        if len(rows) >= 120:
+            rows = rows[:120]
+            break
+    refreshed_at = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
+    return pd.DataFrame(rows), failures, refreshed_at
 
 
 def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
@@ -1648,6 +2170,152 @@ def data_quality_view(frames: Dict[str, pd.DataFrame]) -> None:
         render_dataframe(permission, height=340)
 
 
+def render_narrative_cards(summary: pd.DataFrame) -> None:
+    cards = []
+    for _, row in summary.sort_values("currency").iterrows():
+        sentiment = safe_text(row.get("sentiment", "Not enough data"))
+        tone = narrative_tone(sentiment)
+        dashboard_read = safe_text(row.get("narrative_vs_dashboard", "Not enough data"))
+        cards.append(
+            (
+                f'<div class="narrative-card tone-{tone}">'
+                f'<div class="ccy">{esc(row.get("currency"))}</div>'
+                f'<div class="sentiment">{esc(sentiment)}</div>'
+                f'<span class="pill pill-{tone if tone in ["good", "bad", "info"] else "watch"}">{esc(row.get("confidence", "Low"))} confidence</span>'
+                f'<div class="line">Weighted narrative score: <strong>{to_float(row.get("weighted_score")):+.2f}</strong></div>'
+                f'<div class="line">Sources: {esc(row.get("source_count", 0))} | Latest: {esc(row.get("latest_source_date", "n/a"))}</div>'
+                f'<div class="line">Bullish / Bearish / Neutral-Mixed: {esc(row.get("bullish_sources", 0))} / {esc(row.get("bearish_sources", 0))} / {esc(row.get("neutral_mixed_sources", 0))}</div>'
+                f'<div class="label">Main themes</div><div class="mini">{esc(shorten(row.get("main_themes", "n/a"), 130))}</div>'
+                f'<div class="label">Narrative vs Dashboard</div><div class="mini">{esc(dashboard_read)}</div>'
+                "</div>"
+            )
+        )
+    st.markdown(f'<div class="narrative-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFrame) -> None:
+    st.markdown("#### Source details")
+    for currency in summary.sort_values("currency")["currency"].tolist():
+        rows = details[details["currency"].eq(currency)].copy() if not details.empty and "currency" in details.columns else pd.DataFrame()
+        label = f"{currency} sources"
+        if rows.empty:
+            with st.expander(label, expanded=False):
+                st.info("No public narrative data loaded for this currency.")
+            continue
+        rows = rows.sort_values(["published_dt", "weighted_source_score"], ascending=[False, False], na_position="last").head(12)
+        with st.expander(label, expanded=False):
+            for _, row in rows.iterrows():
+                title = safe_text(row.get("title", "Untitled public item"))
+                url = safe_text(row.get("url", ""))
+                link = f"[{esc(title)}]({url})" if url else f"**{esc(title)}**"
+                published = row.get("published_dt")
+                date_text = "n/a" if pd.isna(published) else str(pd.to_datetime(published).date())
+                st.markdown(
+                    (
+                        f"{link}\n\n"
+                        f"Source: `{esc(row.get('source_name', 'n/a'))}` | Type: `{esc(row.get('source_type', 'n/a'))}` | Date: `{esc(date_text)}`  \n"
+                        f"Detected currency: `{esc(row.get('currency'))}` | Sentiment: `{esc(row.get('sentiment'))}` | "
+                        f"Confidence: `{esc(row.get('confidence'))}` | Relevance: `{esc(row.get('relevance'))}`  \n"
+                        f"Summary: {esc(shorten(row.get('summary', 'n/a'), 220))}  \n"
+                        f"Reason: {esc(shorten(row.get('reason', 'n/a'), 180))}"
+                    ),
+                    unsafe_allow_html=False,
+                )
+                st.divider()
+
+
+def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
+    signals = sort_signal_board(get_frame(frames, "ensemble_signals"))
+    permission = get_frame(frames, "currency_permission")
+    strength = build_currency_strength(signals, permission)
+    csv_narrative = get_frame(frames, "narrative_monitor")
+
+    st.subheader("Public Narrative Monitor")
+    st.markdown(
+        '<div class="section-note">This tab summarizes public market commentary from accessible sources. It is not bank consensus, not proprietary research and not a trading signal.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if "narrative_refresh_token" not in st.session_state:
+        st.session_state["narrative_refresh_token"] = 0
+    if "narrative_live_frame" not in st.session_state:
+        st.session_state["narrative_live_frame"] = pd.DataFrame()
+    if "narrative_failures" not in st.session_state:
+        st.session_state["narrative_failures"] = []
+    if "narrative_refreshed_at" not in st.session_state:
+        st.session_state["narrative_refreshed_at"] = ""
+
+    cols = st.columns([0.8, 0.2])
+    with cols[0]:
+        enable_live_fetch = st.checkbox(
+            "Enable experimental public-source fetching",
+            value=False,
+            help="Optional RSS/API-first MVP. Disabled by default; CSV/JSON upload is the stable path.",
+        )
+    with cols[1]:
+        refresh_clicked = st.button("Refresh public narratives", use_container_width=True)
+
+    if refresh_clicked:
+        if enable_live_fetch:
+            st.session_state["narrative_refresh_token"] += 1
+            with st.spinner("Refreshing public narrative sources..."):
+                live_frame, failures, refreshed_at = fetch_public_narratives(st.session_state["narrative_refresh_token"])
+            st.session_state["narrative_live_frame"] = live_frame
+            st.session_state["narrative_failures"] = failures
+            st.session_state["narrative_refreshed_at"] = refreshed_at
+            if live_frame.empty:
+                st.warning("Live public-source refresh returned no usable narrative rows. CSV/JSON data or the empty state remains available.")
+        else:
+            st.info("Live fetching is disabled. Upload narrative_monitor.csv/json or enable experimental fetching before refreshing.")
+
+    live_narrative = st.session_state.get("narrative_live_frame", pd.DataFrame())
+    narrative = live_narrative if isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty else csv_narrative
+    data_source = "Live public-source cache" if isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty else "Uploaded/local CSV or JSON"
+    summary, details = aggregate_public_narratives(narrative, strength)
+
+    source_count = int(details["url"].astype(str).nunique()) if not details.empty and "url" in details.columns else 0
+    fresh_count = int(details["age_days"].le(14).sum()) if not details.empty and "age_days" in details.columns else 0
+    supports = int(summary["narrative_vs_dashboard"].eq("Supports dashboard").sum()) if not summary.empty else 0
+    conflicts = int(summary["narrative_vs_dashboard"].eq("Conflicts with dashboard").sum()) if not summary.empty else 0
+    render_status_grid(
+        [
+            status_card("Narrative rows", len(details), f"{source_count} unique source links.", "info"),
+            status_card("Fresh rows", fresh_count, "Items within the last 14 days.", "good" if fresh_count else "watch"),
+            status_card("Supports dashboard", supports, "Narrative direction broadly aligns with signal-implied strength.", "good" if supports else "info"),
+            status_card("Conflicts", conflicts, "Narrative direction conflicts with signal-implied strength.", "bad" if conflicts else "info"),
+        ]
+    )
+
+    if st.session_state.get("narrative_refreshed_at"):
+        st.caption(f"Last refreshed: {st.session_state['narrative_refreshed_at']} | Data source: {data_source}")
+    else:
+        st.caption(f"Data source: {data_source}")
+
+    if details.empty:
+        st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or enable public-source fetching later.")
+        with st.expander("Curated source registry", expanded=True):
+            registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
+            render_dataframe(registry[["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled"]], height=420)
+        return
+
+    st.markdown("#### Currency narrative read")
+    render_narrative_cards(summary)
+    render_narrative_source_expanders(summary, details)
+
+    failures = st.session_state.get("narrative_failures", [])
+    if failures:
+        with st.expander("Failed public sources from last refresh", expanded=False):
+            render_dataframe(pd.DataFrame(failures), height=260)
+
+    with st.expander("Curated source registry", expanded=False):
+        registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
+        render_dataframe(registry[["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled"]], height=420)
+    with st.expander("Technical details: narrative aggregation"):
+        render_dataframe(summary, height=320)
+    with st.expander("Technical details: raw narrative rows"):
+        render_dataframe(details.drop(columns=[col for col in ["published_dt"] if col in details.columns]), height=460)
+
+
 def main() -> None:
     inject_css()
     st.sidebar.title("Macro FX")
@@ -1657,7 +2325,7 @@ def main() -> None:
 
     st.title("Macro FX Cockpit")
     st.markdown(
-        f'<div class="subtle">{APP_VERSION} - US/USD-led FX backdrop, signal-implied currency strength, relative FX bias and data quality.</div>',
+        f'<div class="subtle">{APP_VERSION} - US/USD-led FX backdrop, signal-implied currency strength, relative FX bias, public narrative context and data quality.</div>',
         unsafe_allow_html=True,
     )
 
@@ -1665,8 +2333,8 @@ def main() -> None:
         st.warning("Upload the ZIP file from the final Colab export in the left sidebar.")
         st.stop()
 
-    tab_overview, tab_currencies, tab_pairs, tab_regime, tab_data = st.tabs(
-        ["Overview", "Currencies", "Pairs", "Regime", "Data Quality"]
+    tab_overview, tab_currencies, tab_pairs, tab_regime, tab_narrative, tab_data = st.tabs(
+        ["Overview", "Currencies", "Pairs", "Regime", "Narrative Monitor", "Data Quality"]
     )
 
     with tab_overview:
@@ -1677,6 +2345,8 @@ def main() -> None:
         pairs_view(frames)
     with tab_regime:
         regime_view(frames)
+    with tab_narrative:
+        narrative_monitor_view(frames)
     with tab_data:
         data_quality_view(frames)
 

@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.7.1 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v1.8 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 
@@ -40,7 +40,31 @@ streamlit run streamlit_app.py
 - `Currencies`: relative Waehrungsstaerke plus Datenstatus pro Waehrung.
 - `Pairs`: Watchlist, Kontext- und blockierte Pair-Ideen mit OOS- und CPI/Rates-Historie.
 - `Regime`: Scorecard als primaerer US/USD-led FX Backdrop, Markov/Bayes als Warn- und Confidence-Layer.
+- `Narrative Monitor`: optionaler Public-Narrative-Layer aus CSV/JSON oder vorsichtigem RSS/API-Refresh. Dieser Tab ist kein Bank Consensus, kein Trading Signal und veraendert keine Dashboard-Scores.
 - `Data Quality`: Freshness, API-/Source-Luecken und warum Signale downgraded werden.
+
+## Optionaler Narrative Monitor
+
+Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden.
+
+Erwartete Spalten:
+
+- `currency`
+- `source_name`
+- `source_type`
+- `title`
+- `url`
+- `published_at`
+- `summary`
+- `sentiment`
+- `confidence`
+- `relevance`
+- `themes`
+- `supports`
+- `risks`
+- `reason`
+
+Wenn keine Narrative-Datei geladen ist, zeigt die App einen Empty State und die kuratierte Source Registry. Live-Fetching ist standardmaessig aus und muss im Tab bewusst aktiviert werden.
 
 ## v1.2 Ansatz
 
@@ -257,6 +281,15 @@ v1.5 ist der Product-UX-Umbau:
 - Pairs zeigt Pair-Ideen als Ranking und Karten mit Support, Blocker, History und Data Quality
 - Regime zeigt Scorecard vs Markov/Bayesian als Confidence Layer, nicht als automatische Trading-Maschine
 - Data Quality zeigt, welche Daten frisch oder veraltet sind und was verbessert werden muss
+
+v1.8 ergaenzt den Public Narrative Monitor:
+
+- neuer optionaler Tab `Narrative Monitor`
+- CSV/JSON-MVP fuer oeffentliche Market-Commentary-Zusammenfassungen
+- kuratierte Source Registry statt wildem Web-Scraping
+- optionaler Refresh Button fuer vorsichtiges RSS/API-first Live-Fetching
+- gewichteter Public Narrative Read pro Waehrung
+- Vergleich `Narrative vs Dashboard`, ohne bestehende Macro-/Pair-/Data-Quality-Logik zu veraendern
 
 ## Naechste sinnvolle Schritte
 
