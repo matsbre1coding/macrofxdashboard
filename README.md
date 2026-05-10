@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.6.1 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v1.7 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 
@@ -36,10 +36,10 @@ streamlit run streamlit_app.py
 
 ## App-Aufbau
 
-- `Overview`: Marktphase, Daten-Gate, Currency Strength, FX-Bias-Heatmap und wichtigste Pair-Ideen.
+- `Overview`: US/USD-led Global FX Backdrop, Daten-Gate, Signal-Implied Currency Strength, FX-Bias-Heatmap, FX-Implications und wichtigste Pair-Ideen.
 - `Currencies`: relative Waehrungsstaerke plus Datenstatus pro Waehrung.
 - `Pairs`: Watchlist, Kontext- und blockierte Pair-Ideen mit OOS- und CPI/Rates-Historie.
-- `Regime`: Scorecard als primaere Marktphase, Markov/Bayes als Warn- und Confidence-Layer.
+- `Regime`: Scorecard als primaerer US/USD-led FX Backdrop, Markov/Bayes als Warn- und Confidence-Layer.
 - `Data Quality`: Freshness, API-/Source-Luecken und warum Signale downgraded werden.
 
 ## v1.2 Ansatz
@@ -73,8 +73,8 @@ Die Currency-Strength-Engine kombiniert:
 
 Darauf basieren:
 
-- globales Macro-Regime
-- Currency Strength Ranking
+- US/USD-led Global FX Backdrop
+- Signal-Implied Currency Strength Ranking
 - Pair Bias Matrix
 - Top Macro Pair Expressions
 - Validated Current Ideas
@@ -252,10 +252,10 @@ v1.5 ist der Product-UX-Umbau:
 
 - Tabs heissen jetzt `Overview`, `Currencies`, `Pairs`, `Regime`, `Data Quality`
 - Tabellen sind nicht mehr die Hauptansicht, sondern wandern in Details
-- Overview zeigt Currency Strength, Relative FX Bias, Regime Confidence und Top Pair Ideas
-- Currencies zeigt starke/schwache Waehrungen und Datenstatus
-- Pairs zeigt Pair-Ideen als Ranking und Karten
-- Regime zeigt Scorecard vs Markov/Bayesian als Confidence Layer
+- Overview zeigt US/USD-led Backdrop, Signal-Implied Currency Strength, Relative FX Bias, FX Implications und Top Pair Ideas
+- Currencies zeigt starke/schwache Waehrungen, Contribution-Pairs und Datenstatus
+- Pairs zeigt Pair-Ideen als Ranking und Karten mit Support, Blocker, History und Data Quality
+- Regime zeigt Scorecard vs Markov/Bayesian als Confidence Layer, nicht als automatische Trading-Maschine
 - Data Quality zeigt, welche Daten frisch oder veraltet sind und was verbessert werden muss
 
 ## Naechste sinnvolle Schritte

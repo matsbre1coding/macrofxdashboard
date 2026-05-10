@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.6.1 Research Cockpit"
+APP_VERSION = "v1.7 Research Cockpit"
 
 
 st.set_page_config(
@@ -154,6 +154,60 @@ REGIME_EXPLANATIONS = {
     "Reflation / Expansion": "Wachstum/Risiko verbessern sich. Trend- und Carry-Ideen werden interessanter.",
     "Goldilocks / Disinflationary Growth": "Wachstum ok, Inflation entspannt. Risikoassets haben oft Rückenwind.",
     "Neutral / Transition": "Kein klares Makrobild. Signalqualität muss besonders streng geprüft werden.",
+}
+
+
+REGIME_EXPLANATIONS.update(
+    {
+        "Stagflation / Policy Squeeze": "Inflation and commodity pressure are elevated while growth and risk do not provide a clean trend setup.",
+        "Crisis / Liquidity Stress": "Growth and risk can be under stress. Safe-haven and liquidity logic tends to matter more, but it still needs driver confirmation.",
+        "Deflationary Slowdown": "Growth and inflation can cool together. Trend-following signals tend to become more fragile.",
+        "Reflation / Expansion": "Growth and risk can improve. Trend and carry ideas can receive more support when data quality also passes.",
+        "Goldilocks / Disinflationary Growth": "Growth can be acceptable while inflation pressure cools. Risk assets can receive a friendlier backdrop.",
+        "Neutral / Transition": "No clean macro backdrop. Signal quality needs stricter confirmation.",
+    }
+)
+
+
+BACKDROP_LABEL = "US/USD-led Global FX Backdrop"
+BACKDROP_EXPLANATION = (
+    "This regime is derived mainly from US macro data, US rates, risk markets, "
+    "commodities and USD momentum. It is a global FX backdrop, not a country-by-country macro diagnosis."
+)
+
+
+REGIME_FX_IMPLICATIONS = {
+    "Stagflation / Policy Squeeze": [
+        "Commodity-linked currencies such as CAD and AUD can benefit if commodity strength persists.",
+        "High-beta currencies such as AUD and NZD remain vulnerable if risk sentiment turns lower.",
+        "USD can be mixed because inflation/policy support may conflict with risk and commodity dynamics.",
+        "JPY and CHF usually need clearer risk-off confirmation.",
+    ],
+    "Crisis / Liquidity Stress": [
+        "USD, JPY and CHF can receive support if risk-off pressure is confirmed by growth and risk drivers.",
+        "High-beta and commodity-linked currencies can come under pressure if liquidity stress dominates.",
+        "Carry and pro-risk FX ideas tend to need smaller sizing or stronger confirmation.",
+    ],
+    "Deflationary Slowdown": [
+        "JPY and CHF can receive support if lower yields and weaker growth dominate the backdrop.",
+        "Commodity-linked currencies can be pressured if demand expectations weaken.",
+        "USD can be mixed depending on whether safe-haven demand or lower US yields dominate.",
+    ],
+    "Reflation / Expansion": [
+        "High-beta and commodity-linked currencies can receive support when risk appetite confirms the backdrop.",
+        "JPY and CHF can lag if safe-haven demand fades.",
+        "USD can be mixed when growth support conflicts with broader risk appetite.",
+    ],
+    "Goldilocks / Disinflationary Growth": [
+        "Risk-sensitive currencies can receive support when growth is stable and inflation pressure cools.",
+        "JPY and CHF can lag unless risk-off pressure returns.",
+        "USD can soften if lower inflation reduces policy support while risk appetite improves.",
+    ],
+    "Neutral / Transition": [
+        "FX implications are less reliable because the backdrop is not decisive.",
+        "Pair ideas should lean more heavily on data quality, OOS history and fresh confirmation.",
+        "Avoid treating one currency as structurally strong or weak from the backdrop alone.",
+    ],
 }
 
 
@@ -309,6 +363,25 @@ def inject_css() -> None:
             font-weight: 760;
             margin-bottom: 6px;
         }
+        .pair-card .kv {
+            border-top: 1px solid rgba(148, 163, 184, 0.14);
+            padding-top: 7px;
+            margin-top: 7px;
+        }
+        .pair-card .kv span {
+            display: block;
+            color: #94a3b8;
+            font-size: 0.68rem;
+            font-weight: 750;
+            text-transform: uppercase;
+            margin-bottom: 2px;
+        }
+        .pair-card .kv p {
+            color: #cbd5e1;
+            font-size: 0.77rem;
+            line-height: 1.34;
+            margin: 0;
+        }
         .pill {
             display: inline-block;
             border-radius: 999px;
@@ -387,6 +460,34 @@ def inject_css() -> None:
         }
         .data-gate span {
             color: #cbd5e1;
+        }
+        .implication-list {
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.58);
+            padding: 14px 16px;
+            margin: 8px 0 18px 0;
+        }
+        .implication-list .title {
+            color: #f8fafc;
+            font-size: 1.02rem;
+            font-weight: 760;
+            margin-bottom: 8px;
+        }
+        .implication-list .context {
+            color: #94a3b8;
+            font-size: 0.84rem;
+            line-height: 1.38;
+            margin-bottom: 9px;
+        }
+        .implication-list ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .implication-list li {
+            color: #cbd5e1;
+            margin: 5px 0;
+            line-height: 1.38;
         }
         .pair-card .meta {
             color: #94a3b8;
@@ -770,6 +871,110 @@ def to_bool_series(series: pd.Series) -> pd.Series:
     return text.isin(["true", "1", "yes", "y", "ja"])
 
 
+def score_lookup(scores: pd.DataFrame, feature: str) -> float | None:
+    if scores.empty or not {"feature", "latest_score"}.issubset(scores.columns):
+        return None
+    row = scores[scores["feature"].astype(str).eq(feature)]
+    if row.empty:
+        return None
+    return to_float(row.iloc[0].get("latest_score"), default=float("nan"))
+
+
+def render_fx_implications(regime: str, scores: pd.DataFrame) -> None:
+    lines = list(REGIME_FX_IMPLICATIONS.get(regime, REGIME_FX_IMPLICATIONS["Neutral / Transition"]))
+    commodity_score = score_lookup(scores, "commodity_score")
+    policy_score = score_lookup(scores, "policy_score")
+    if regime == "Stagflation / Policy Squeeze" and commodity_score is not None and policy_score is not None:
+        if commodity_score >= 1.0 and policy_score < 0.75:
+            lines.append(
+                "In the current data, this looks more like an inflation/commodity squeeze than pure policy tightening because commodity_score is high while policy_score is not strongly positive."
+            )
+    items = "".join(f"<li>{esc(line)}</li>" for line in lines)
+    st.markdown(
+        (
+            '<div class="implication-list">'
+            '<div class="title">FX Implications</div>'
+            f'<div class="context">{esc(BACKDROP_EXPLANATION)}</div>'
+            f"<ul>{items}</ul>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def currency_data_issue(currency: str, permission: pd.DataFrame, freshness: pd.DataFrame) -> str:
+    ccy = safe_text(currency, "").upper()
+    if not ccy:
+        return ""
+
+    issues: list[str] = []
+    if not freshness.empty and {"currency", "field", "is_current_fresh"}.issubset(freshness.columns):
+        rows = freshness[freshness["currency"].astype(str).str.upper().eq(ccy)]
+        stale_rows = rows[~to_bool_series(rows["is_current_fresh"])]
+        for _, stale in stale_rows.iterrows():
+            field = safe_text(stale.get("field", "")).lower()
+            if "cpi" in field:
+                issues.append(f"{ccy} CPI stale")
+            elif "short" in field:
+                issues.append(f"{ccy} short-rate stale")
+            elif "long" in field:
+                issues.append(f"{ccy} long-rate stale")
+            elif field:
+                issues.append(f"{ccy} {field} stale")
+
+    if not permission.empty and "currency" in permission.columns:
+        rows = permission[permission["currency"].astype(str).str.upper().eq(ccy)]
+        if not rows.empty:
+            row = rows.iloc[0]
+            if "cpi_fresh" in rows.columns and not to_bool_series(pd.Series([row.get("cpi_fresh")])).iloc[0]:
+                issues.append(f"{ccy} CPI stale")
+            if "rates_fresh" in rows.columns and not to_bool_series(pd.Series([row.get("rates_fresh")])).iloc[0]:
+                issues.append(f"{ccy} rates stale")
+
+    unique = []
+    for issue in issues:
+        if issue not in unique:
+            unique.append(issue)
+    return "; ".join(unique)
+
+
+def pair_data_quality_note(row: pd.Series, permission: pd.DataFrame, freshness: pd.DataFrame) -> str:
+    long_ccy, short_ccy = infer_long_short(row)
+    issues = [currency_data_issue(ccy, permission, freshness) for ccy in [long_ccy, short_ccy]]
+    issues = [issue for issue in issues if issue]
+    if issues:
+        return "Rates-only / limited: " + "; ".join(issues)
+    return "No current data blocker detected for the two currencies."
+
+
+def pair_support_note(row: pd.Series, strength_map: dict[str, float]) -> str:
+    long_ccy, short_ccy = infer_long_short(row)
+    if long_ccy and short_ccy:
+        long_strength = strength_map.get(long_ccy, 0.0)
+        short_strength = strength_map.get(short_ccy, 0.0)
+        if long_strength > short_strength:
+            return f"{long_ccy} appears stronger than {short_ccy} in the current signal-implied board."
+    expression = safe_text(row.get("expression", ""))
+    if expression:
+        return f"The current exported score can support {expression}."
+    return "The current exported score can support this pair idea."
+
+
+def pair_blocker_note(row: pd.Series, permission: pd.DataFrame, freshness: pd.DataFrame) -> str:
+    action = safe_text(row.get("ensemble_action", ""))
+    reason = friendly_reason(safe_text(row.get("ensemble_reason", "")))
+    data_note = pair_data_quality_note(row, permission, freshness)
+    if "No current data blocker" not in data_note:
+        return data_note
+    if action == "Research watch only":
+        return "Macro gate, Bayesian conflict or data freshness still blocks clean live action."
+    if action == "Context watch":
+        return "Current ensemble keeps this as context rather than a clean baseline signal."
+    if action == "Research / no action":
+        return reason or "Blocked by at least one frozen baseline or ensemble gate."
+    return "No major blocker shown by the exported gate."
+
+
 def sort_signal_board(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -800,7 +1005,10 @@ def readable_posture(value: str) -> str:
 
 
 def overview_reason(regime: str, posture: str, gate: str, stale: str, prob_top: str, bayes_read: str) -> str:
-    regime_text = REGIME_EXPLANATIONS.get(regime, "Die Marktphase wird aus Wachstum, Inflation, Zinsen, Risiko, Rohstoffen und USD-Druck abgeleitet.")
+    regime_text = REGIME_EXPLANATIONS.get(
+        regime,
+        "The backdrop is derived from growth, inflation, rates, risk, commodities and USD pressure.",
+    )
     gate_text = "closed" if gate == "Closed" else safe_text(gate)
     model_note = ""
     if prob_top not in ["", "n/a", regime]:
@@ -809,7 +1017,7 @@ def overview_reason(regime: str, posture: str, gate: str, stale: str, prob_top: 
             f"but the driver check is {friendly_bayes(bayes_read)}."
         )
     if "No clean" in str(posture):
-        return f"{regime_text} Trend gate is {gate_text}; stale CPI blocks clean real-rate use for {stale}.{model_note}"
+        return f"{regime_text} Trend gate is {gate_text}; stale CPI can block clean real-rate use for {stale}.{model_note}"
     return f"{regime_text} Current posture: {posture}.{model_note}"
 
 
@@ -850,21 +1058,28 @@ def build_currency_strength(signals: pd.DataFrame, permission: pd.DataFrame) -> 
     if not currencies:
         currencies = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
 
-    rows = {currency: {"currency": currency, "strength": 0.0, "ideas": 0} for currency in sorted(currencies)}
+    rows = {
+        currency: {"currency": currency, "strength": 0.0, "ideas": 0, "contribution_pairs": []}
+        for currency in sorted(currencies)
+    }
     for _, row in signals.iterrows():
         long_ccy, short_ccy = infer_long_short(row)
         if not long_ccy or not short_ccy:
             continue
+        pair = safe_text(row.get("pair", ""), "")
         score = abs(to_float(row.get("abs_score", row.get("ensemble_final_score", row.get("bias_score", 0.0)))))
         action = safe_text(row.get("ensemble_action", ""))
         weight = {"Research watch only": 1.0, "Context watch": 0.65, "Research / no action": 0.25}.get(action, 0.55)
         contribution = score * weight
-        rows.setdefault(long_ccy, {"currency": long_ccy, "strength": 0.0, "ideas": 0})
-        rows.setdefault(short_ccy, {"currency": short_ccy, "strength": 0.0, "ideas": 0})
+        rows.setdefault(long_ccy, {"currency": long_ccy, "strength": 0.0, "ideas": 0, "contribution_pairs": []})
+        rows.setdefault(short_ccy, {"currency": short_ccy, "strength": 0.0, "ideas": 0, "contribution_pairs": []})
         rows[long_ccy]["strength"] += contribution
         rows[short_ccy]["strength"] -= contribution
         rows[long_ccy]["ideas"] += 1
         rows[short_ccy]["ideas"] += 1
+        if pair:
+            rows[long_ccy]["contribution_pairs"].append((pair, contribution))
+            rows[short_ccy]["contribution_pairs"].append((pair, -contribution))
 
     strength = pd.DataFrame(rows.values())
     if not permission.empty and "currency" in permission.columns:
@@ -874,6 +1089,14 @@ def build_currency_strength(signals: pd.DataFrame, permission: pd.DataFrame) -> 
         strength = strength.merge(meta.drop_duplicates("currency"), on="currency", how="left")
     strength["strength"] = pd.to_numeric(strength["strength"], errors="coerce").fillna(0.0).round(2)
     strength["read"] = strength["strength"].apply(lambda x: "Strong" if x > 0.25 else ("Weak" if x < -0.25 else "Neutral"))
+    strength["top_pairs"] = strength["contribution_pairs"].apply(
+        lambda pairs: ", ".join(
+            f"{pair} {value:+.2f}"
+            for pair, value in sorted(pairs, key=lambda item: abs(item[1]), reverse=True)[:3]
+        )
+        if isinstance(pairs, list)
+        else ""
+    )
     return strength.sort_values("strength", ascending=False)
 
 
@@ -926,7 +1149,7 @@ def render_overview_panel(regime: pd.DataFrame, permission: pd.DataFrame) -> Non
             f'<div class="headline">{esc(headline)}</div>'
             f'<div class="body">{esc(body)}</div>'
             '<div class="mini-grid">'
-            f'<div class="mini-stat"><div class="k">Macro Regime</div><div class="v">{esc(final_regime)}</div></div>'
+            f'<div class="mini-stat"><div class="k">{esc(BACKDROP_LABEL)}</div><div class="v">{esc(final_regime)}</div></div>'
             f'<div class="mini-stat"><div class="k">Confidence</div><div class="v">{esc(confidence)}/100</div></div>'
             f'<div class="mini-stat"><div class="k">Clean Currencies</div><div class="v">{clean}/{total}</div></div>'
             "</div></div>"
@@ -935,10 +1158,21 @@ def render_overview_panel(regime: pd.DataFrame, permission: pd.DataFrame) -> Non
     )
 
 
-def render_pair_cards(signals: pd.DataFrame, limit: int = 4) -> None:
+def render_pair_cards(
+    signals: pd.DataFrame,
+    permission: pd.DataFrame | None = None,
+    freshness: pd.DataFrame | None = None,
+    strength: pd.DataFrame | None = None,
+    limit: int = 4,
+) -> None:
     if signals.empty:
         st.info("No pair ideas loaded.")
         return
+    permission = pd.DataFrame() if permission is None else permission
+    freshness = pd.DataFrame() if freshness is None else freshness
+    strength_map = {}
+    if strength is not None and not strength.empty and {"currency", "strength"}.issubset(strength.columns):
+        strength_map = dict(zip(strength["currency"].astype(str).str.upper(), pd.to_numeric(strength["strength"], errors="coerce").fillna(0.0)))
     top = sort_signal_board(signals).head(limit)
     cards = []
     for _, row in top.iterrows():
@@ -951,15 +1185,23 @@ def render_pair_cards(signals: pd.DataFrame, limit: int = 4) -> None:
         cpi = friendly_history(safe_text(row.get("cpi_oos_label", "")))
         reason = friendly_reason(safe_text(row.get("ensemble_reason", "")))
         tone = action_tone(safe_text(row.get("ensemble_action", "")))
+        support = pair_support_note(row, strength_map)
+        blocker = pair_blocker_note(row, permission, freshness)
+        data_quality = pair_data_quality_note(row, permission, freshness)
         cards.append(
             (
                 '<div class="pair-card">'
                 f'<div class="pair">{esc(pair)}</div>'
-                f'<div class="idea">{esc(idea)}</div>'
+                f'<div class="idea">Signal: {esc(idea)}</div>'
                 f'<div class="score">{score:.2f}</div>'
                 f'<span class="pill pill-{tone}">{esc(status)}</span>'
                 f'<span class="pill pill-info">{esc(use)}</span>'
-                f'<div class="meta">Rates history: {esc(rates)}<br>Real-rate history: {esc(cpi)}</div>'
+                f'<div class="kv"><span>Status</span><p>{esc(status)}</p></div>'
+                f'<div class="kv"><span>Permission</span><p>{esc(use)}</p></div>'
+                f'<div class="kv"><span>Main support</span><p>{esc(shorten(support, 120))}</p></div>'
+                f'<div class="kv"><span>Main blocker</span><p>{esc(shorten(blocker, 140))}</p></div>'
+                f'<div class="kv"><span>History</span><p>Rates: {esc(rates)} | Real-rate: {esc(cpi)}</p></div>'
+                f'<div class="kv"><span>Data quality</span><p>{esc(shorten(data_quality, 130))}</p></div>'
                 f'<div class="reason">{esc(shorten(reason, 130))}</div>'
                 "</div>"
             )
@@ -974,6 +1216,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
     freshness = get_frame(frames, "source_freshness")
     readiness = get_frame(frames, "source_readiness")
     calibrated = get_frame(frames, "calibrated_latest")
+    scores = get_frame(frames, "ensemble_scores")
     baseline = get_frame(frames, "final_baseline")
     split = get_frame(frames, "final_split")
 
@@ -990,12 +1233,14 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
     posture = lookup(regime, "Current posture")
     render_status_grid(
         [
-            status_card("Current market phase", final_regime, f"Confidence {final_confidence}/100", "good"),
+            status_card(BACKDROP_LABEL, final_regime, f"Confidence {final_confidence}/100", "good"),
             status_card("Live signal status", readable_posture(posture), "Research cockpit, not an auto-trader.", "watch" if "No clean" in posture else "good"),
             status_card("Clean data coverage", f"{clean}/{total}", "Currencies with usable real-rate context.", "good" if clean >= max(total - 2, 1) else "watch"),
             status_card("Watchlist / baseline", f'{buckets["watch"]} / {baseline_candidates}', "Current watch ideas and frozen baseline candidates.", "watch"),
         ]
     )
+    st.markdown(f'<div class="section-note">{esc(BACKDROP_EXPLANATION)}</div>', unsafe_allow_html=True)
+    render_fx_implications(final_regime, scores)
 
     strength = build_currency_strength(signals, permission)
     currencies = strength["currency"].tolist()
@@ -1003,8 +1248,11 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     left, right = st.columns([0.95, 1.05])
     with left:
-        st.subheader("Currency Strength")
-        st.markdown('<div class="section-note">Signal-implied strength from the exported macro/policy pair board. Green means favored across current ideas; red means used as the weaker side.</div>', unsafe_allow_html=True)
+        st.subheader("Signal-Implied Currency Strength")
+        st.markdown(
+            '<div class="section-note">This is aggregated from current pair ideas. A currency receives positive contribution when it appears on the long side and negative contribution when it appears on the short side. It is not a full country macro score.</div>',
+            unsafe_allow_html=True,
+        )
         plot_df = strength.copy()
         fig = px.bar(
             plot_df.sort_values("strength"),
@@ -1013,7 +1261,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
             color="read",
             color_discrete_map={"Strong": "#22c55e", "Neutral": "#60a5fa", "Weak": "#ef4444"},
             orientation="h",
-            hover_data=[col for col in ["data_quality", "permission", "ideas"] if col in plot_df.columns],
+            hover_data=[col for col in ["data_quality", "permission", "ideas", "top_pairs"] if col in plot_df.columns],
             labels={"strength": "Relative strength", "currency": "Currency"},
         )
         fig.update_layout(legend_title_text="")
@@ -1041,7 +1289,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     bottom_left, bottom_right = st.columns([0.86, 1.14])
     with bottom_left:
-        st.subheader("Regime Confidence")
+        st.subheader("Backdrop Confidence")
         if not calibrated.empty and {"regime", "calibrated_probability"}.issubset(calibrated.columns):
             plot_df = calibrated.copy().sort_values("calibrated_probability", ascending=True)
             fig = px.bar(
@@ -1051,7 +1299,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
                 orientation="h",
                 color="is_scorecard_regime" if "is_scorecard_regime" in plot_df.columns else None,
                 color_discrete_map={True: "#22c55e", False: "#60a5fa"},
-                labels={"calibrated_probability": "Probability", "regime": "Regime"},
+                labels={"calibrated_probability": "Probability", "regime": "Backdrop"},
             )
             fig.update_layout(xaxis_tickformat=".0%")
             style_chart(fig, height=320, showlegend=False)
@@ -1061,7 +1309,7 @@ def overview_view(frames: Dict[str, pd.DataFrame]) -> None:
     with bottom_right:
         st.subheader("Top Pair Ideas")
         st.markdown('<div class="section-note">Cards show research priority and data-gated permission. They are watchlist/context signals unless the exported baseline explicitly allows action.</div>', unsafe_allow_html=True)
-        render_pair_cards(signals, limit=6)
+        render_pair_cards(signals, permission, freshness, strength, limit=6)
 
     with st.expander("Technical details: regime decision export"):
         render_dataframe(regime, height=260)
@@ -1078,7 +1326,10 @@ def currencies_view(frames: Dict[str, pd.DataFrame]) -> None:
     strength = build_currency_strength(signals, permission)
 
     st.subheader("Currencies")
-    st.markdown('<div class="section-note">Currency strength comes from the current pair board, then gets filtered through data quality: clean real-rate, rates-only or stale.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-note">Signal-implied currency strength is aggregated from current pair ideas. It is not a full country macro score; data quality decides whether the read is clean, rates-only or stale.</div>',
+        unsafe_allow_html=True,
+    )
     render_data_gate_note(permission, freshness, readiness)
 
     summary = data_quality_summary(permission, freshness, readiness)
@@ -1099,7 +1350,7 @@ def currencies_view(frames: Dict[str, pd.DataFrame]) -> None:
             color="read",
             color_discrete_map={"Strong": "#22c55e", "Neutral": "#60a5fa", "Weak": "#ef4444"},
             orientation="h",
-            hover_data=[col for col in ["data_quality", "policy_mode", "ideas"] if col in strength.columns],
+            hover_data=[col for col in ["data_quality", "policy_mode", "ideas", "top_pairs"] if col in strength.columns],
             labels={"strength": "Relative strength", "currency": "Currency"},
         )
         fig.update_layout(legend_title_text="")
@@ -1117,6 +1368,7 @@ def currencies_view(frames: Dict[str, pd.DataFrame]) -> None:
                 f'<div class="line">Read: {esc(row.get("read"))}</div>'
                 f'<div class="line">Data: <span class="pill pill-{tone}">{esc(quality)}</span></div>'
                 f'<div class="line">Policy mode: {esc(row.get("policy_mode", "n/a"))}</div>'
+                f'<div class="line">Main pairs: {esc(row.get("top_pairs", "n/a"))}</div>'
                 "</div>"
             )
         )
@@ -1131,12 +1383,16 @@ def pairs_view(frames: Dict[str, pd.DataFrame]) -> None:
     permission = get_frame(frames, "currency_permission")
     freshness = get_frame(frames, "source_freshness")
     readiness = get_frame(frames, "source_readiness")
+    strength = build_currency_strength(signals, permission)
     if signals.empty:
         st.info("No pair data loaded.")
         return
 
     st.subheader("Pairs")
-    st.markdown('<div class="section-note">Macro-derived pair ideas ranked by current score and filtered by data quality and historical checks.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-note">Macro-derived research ideas ranked by current score and filtered by data quality, OOS history and ensemble gates. These are not automatic trade recommendations.</div>',
+        unsafe_allow_html=True,
+    )
     render_data_gate_note(permission, freshness, readiness)
 
     buckets = signal_bucket_counts(signals)
@@ -1181,7 +1437,7 @@ def pairs_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Pair Cards")
-    render_pair_cards(filtered, limit=8)
+    render_pair_cards(filtered, permission, freshness, strength, limit=8)
 
     with st.expander("Technical details: simplified pair table"):
         render_dataframe(simplified_signals(filtered), height=430)
@@ -1197,8 +1453,11 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
     calibrated = get_frame(frames, "calibrated_latest")
     prob_driver = get_frame(frames, "prob_driver")
 
-    st.subheader("Regime")
-    st.markdown('<div class="section-note">Scorecard is the primary regime. Markov/Bayesian acts as second-opinion confidence and warning layer.</div>', unsafe_allow_html=True)
+    st.subheader(BACKDROP_LABEL)
+    st.markdown(
+        f'<div class="section-note">{esc(BACKDROP_EXPLANATION)} Scorecard is primary; Markov/Bayesian acts as a second-opinion confidence and warning layer.</div>',
+        unsafe_allow_html=True,
+    )
 
     final_regime = lookup(regime, "Final regime read")
     prob_top = lookup(regime, "Probabilistic top regime")
@@ -1206,37 +1465,46 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
     confidence = lookup(regime, "Final regime confidence")
     cols = st.columns(3)
     with cols[0]:
-        metric_card("Scorecard regime", final_regime, f"Confidence {confidence}/100", "good")
+        metric_card("Scorecard backdrop", final_regime, f"Confidence {confidence}/100", "good")
     with cols[1]:
-        metric_card("Markov/Bayes view", prob_top, f"Second opinion: {friendly_bayes(bayes_read)}", "watch")
+        metric_card("Markov/Bayes warning", prob_top, f"Second opinion: {friendly_bayes(bayes_read)}", "watch")
     with cols[2]:
-        metric_card("Final use", "Confidence layer", "Does not override the baseline unless drivers confirm.", "info")
+        metric_card("Final regime decision", final_regime, "Scorecard remains primary unless drivers confirm the warning.", "info")
 
     prob_fit = "n/a"
     scorecard_fit = "n/a"
+    prob_fit_value = None
+    scorecard_fit_value = None
     if not alignment.empty and {"regime", "semantic_fit_score"}.issubset(alignment.columns):
         scorecard_row = alignment[alignment["regime"].astype(str).eq(final_regime)]
         prob_row = alignment[alignment["regime"].astype(str).eq(prob_top)]
         if not scorecard_row.empty:
-            scorecard_fit = f'{to_float(scorecard_row.iloc[0].get("semantic_fit_score")):.0f}/100'
+            scorecard_fit_value = to_float(scorecard_row.iloc[0].get("semantic_fit_score"))
+            scorecard_fit = f"{scorecard_fit_value:.0f}/100"
         if not prob_row.empty:
-            prob_fit = f'{to_float(prob_row.iloc[0].get("semantic_fit_score")):.0f}/100'
+            prob_fit_value = to_float(prob_row.iloc[0].get("semantic_fit_score"))
+            prob_fit = f"{prob_fit_value:.0f}/100"
     if prob_top not in ["", "n/a", final_regime]:
+        warning_title = "Markov/Bayes warning, not a regime switch."
+        if "Crisis" in prob_top and (prob_fit_value is None or prob_fit_value < 50):
+            warning_title = "Crisis warning, not crisis confirmation."
         st.markdown(
             (
                 '<div class="explain-box">'
-                "<strong>Markov/Bayes warning, not a regime switch.</strong> "
+                f"<strong>{esc(warning_title)}</strong> "
                 "Scorecard remains primary because the exported driver alignment fits "
                 f"<strong>{esc(final_regime)}</strong> at {esc(scorecard_fit)} while the probabilistic top regime "
-                f"<strong>{esc(prob_top)}</strong> fits the current macro drivers at {esc(prob_fit)}."
+                f"<strong>{esc(prob_top)}</strong> fits the current macro drivers at {esc(prob_fit)}. "
+                "This is accepted as a confidence warning, not as a replacement for the final backdrop."
                 "</div>"
             ),
             unsafe_allow_html=True,
         )
+    render_fx_implications(final_regime, scores)
 
     left, right = st.columns([1.0, 1.0])
     with left:
-        st.markdown("#### Regime probabilities")
+        st.markdown("#### Backdrop probabilities")
         if not calibrated.empty and {"regime", "calibrated_probability"}.issubset(calibrated.columns):
             plot_df = calibrated.copy().sort_values("calibrated_probability")
             fig = px.bar(
@@ -1246,7 +1514,7 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
                 orientation="h",
                 color="is_scorecard_regime" if "is_scorecard_regime" in plot_df.columns else None,
                 color_discrete_map={True: "#22c55e", False: "#60a5fa"},
-                labels={"calibrated_probability": "Probability", "regime": "Regime"},
+                labels={"calibrated_probability": "Probability", "regime": "Backdrop"},
             )
             fig.update_layout(xaxis_tickformat=".0%")
             style_chart(fig, height=420, showlegend=False)
@@ -1270,7 +1538,7 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
         else:
             render_dataframe(scores, height=320)
 
-    st.markdown("#### Regime fit")
+    st.markdown("#### Driver fit")
     if not alignment.empty and {"regime", "semantic_fit_score"}.issubset(alignment.columns):
         plot_df = alignment.copy()
         plot_df["Fit"] = frame_col(plot_df, "semantic_fit_label").astype(str).map(friendly_fit)
@@ -1281,7 +1549,7 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
             color="Fit",
             orientation="h",
             range_x=[0, 100],
-            labels={"semantic_fit_score": "Fit", "regime": "Regime"},
+            labels={"semantic_fit_score": "Fit", "regime": "Backdrop"},
         )
         fig.update_layout(legend_title_text="")
         style_chart(fig, height=360)
@@ -1367,7 +1635,7 @@ def main() -> None:
 
     st.title("Macro FX Cockpit")
     st.markdown(
-        f'<div class="subtle">{APP_VERSION} - Regime, currency strength, relative FX bias and data quality.</div>',
+        f'<div class="subtle">{APP_VERSION} - US/USD-led FX backdrop, signal-implied currency strength, relative FX bias and data quality.</div>',
         unsafe_allow_html=True,
     )
 
