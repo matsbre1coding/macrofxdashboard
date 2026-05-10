@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.6 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v1.6.1 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 

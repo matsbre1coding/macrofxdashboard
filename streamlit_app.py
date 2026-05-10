@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import html
 import os
+import re
 import zipfile
 from pathlib import Path
 from typing import Dict
@@ -13,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.6 Research Cockpit"
+APP_VERSION = "v1.6.1 Research Cockpit"
 
 
 st.set_page_config(
@@ -38,6 +39,9 @@ CSV_FILES = {
     "source_freshness": "macro_fx_source_freshness_audit.csv",
     "source_readiness": "macro_fx_primary_source_readiness.csv",
 }
+
+
+FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
 
 
 NUMERIC_COLUMN_HINTS = [
@@ -561,38 +565,38 @@ def friendly_bayes(value: str) -> str:
 
 def metric_card(label: str, value: str, detail: str = "", tone: str = "info") -> None:
     st.markdown(
-        f"""
-        <div class="metric-card tone-{tone}">
-            <div class="label">{label}</div>
-            <div class="value">{value}</div>
-            <div class="detail">{detail}</div>
-        </div>
-        """,
+        (
+            f'<div class="metric-card tone-{tone}">'
+            f'<div class="label">{esc(label)}</div>'
+            f'<div class="value">{esc(value)}</div>'
+            f'<div class="detail">{esc(detail)}</div>'
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
 
 
 def hero_card(title: str, text: str, eyebrow: str = "Overview") -> None:
     st.markdown(
-        f"""
-        <div class="hero">
-            <div class="eyebrow">{eyebrow}</div>
-            <div class="headline">{title}</div>
-            <div class="copy">{text}</div>
-        </div>
-        """,
+        (
+            '<div class="hero">'
+            f'<div class="eyebrow">{esc(eyebrow)}</div>'
+            f'<div class="headline">{esc(title)}</div>'
+            f'<div class="copy">{esc(text)}</div>'
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
 
 
 def status_card(label: str, value: object, detail: str = "", tone: str = "info") -> str:
-    return f"""
-    <div class="status-card tone-{tone}">
-        <div class="k">{esc(label)}</div>
-        <div class="v">{esc(value)}</div>
-        <div class="d">{esc(detail)}</div>
-    </div>
-    """
+    return (
+        f'<div class="status-card tone-{tone}">'
+        f'<div class="k">{esc(label)}</div>'
+        f'<div class="v">{esc(value)}</div>'
+        f'<div class="d">{esc(detail)}</div>'
+        "</div>"
+    )
 
 
 def render_status_grid(cards: list[str]) -> None:
@@ -625,18 +629,41 @@ def shorten(value: object, limit: int = 120) -> str:
     text = safe_text(value, "")
     if len(text) <= limit:
         return text
-    return text[: max(limit - 1, 1)].rstrip() + "…"
+    return text[: max(limit - 3, 1)].rstrip() + "..."
 
 
 def quality_tone(value: object) -> str:
     text = safe_text(value, "").lower()
-    if any(token in text for token in ["good", "fresh", "allowed", "ok"]):
-        return "good"
-    if any(token in text for token in ["stale", "watch", "rates-only", "limited", "missing", "key"]):
-        return "watch"
     if any(token in text for token in ["blocked", "no live", "avoid", "contrarian", "broken"]):
         return "bad"
+    if any(token in text for token in ["stale", "watch", "rates-only", "limited", "missing", "key"]):
+        return "watch"
+    if any(token in text for token in ["good", "fresh", "allowed", "ok"]):
+        return "good"
     return "info"
+
+
+def infer_long_short(row: pd.Series) -> tuple[str, str]:
+    long_ccy = safe_text(row.get("long_currency", "")).upper()
+    short_ccy = safe_text(row.get("short_currency", "")).upper()
+    if long_ccy in FX_CURRENCIES and short_ccy in FX_CURRENCIES and long_ccy != short_ccy:
+        return long_ccy, short_ccy
+
+    expression = safe_text(row.get("expression", "")).upper()
+    match = re.search(r"LONG\s+(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD)\s*/\s*SHORT\s+(USD|EUR|GBP|JPY|CHF|CAD|AUD|NZD)", expression)
+    if match and match.group(1) != match.group(2):
+        return match.group(1), match.group(2)
+
+    pair = re.sub(r"[^A-Z]", "", safe_text(row.get("pair", "")).upper())
+    if len(pair) >= 6:
+        base, quote = pair[:3], pair[3:6]
+        if base in FX_CURRENCIES and quote in FX_CURRENCIES:
+            direction = safe_text(row.get("direction", "")).lower()
+            bias = to_float(row.get("bias_score", 0.0))
+            if "bear" in direction or bias < 0:
+                return quote, base
+            return base, quote
+    return "", ""
 
 
 def data_quality_summary(permission: pd.DataFrame, freshness: pd.DataFrame, readiness: pd.DataFrame) -> dict[str, int]:
@@ -675,15 +702,15 @@ def signal_bucket_counts(signals: pd.DataFrame) -> dict[str, int]:
 def render_data_gate_note(permission: pd.DataFrame, freshness: pd.DataFrame, readiness: pd.DataFrame) -> None:
     summary = data_quality_summary(permission, freshness, readiness)
     st.markdown(
-        f"""
-        <div class="data-gate">
-            <strong>Data gate:</strong>
-            <span>{summary["clean_real_rate"]}/{summary["total_currencies"]} currencies have clean real-rate context.
-            {summary["rates_only"]} are rates-only or limited.
-            {summary["stale_fields"]} source fields are stale.
-            {summary["key_required"]} source rows need an API key or manual upgrade.</span>
-        </div>
-        """,
+        (
+            '<div class="data-gate">'
+            "<strong>Data gate:</strong> "
+            f'<span>{summary["clean_real_rate"]}/{summary["total_currencies"]} currencies have clean real-rate context. '
+            f'{summary["rates_only"]} are rates-only or limited. '
+            f'{summary["stale_fields"]} source fields are stale. '
+            f'{summary["key_required"]} source rows need an API key or manual upgrade.</span>'
+            "</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -803,19 +830,32 @@ def build_currency_strength(signals: pd.DataFrame, permission: pd.DataFrame) -> 
     currencies = set()
     for column in ["long_currency", "short_currency", "base_currency", "quote_currency"]:
         if column in signals.columns:
-            currencies.update(signals[column].dropna().astype(str).str.upper().tolist())
+            currencies.update(
+                value
+                for value in signals[column].dropna().astype(str).str.upper().tolist()
+                if value in FX_CURRENCIES
+            )
+    for _, row in signals.iterrows():
+        long_ccy, short_ccy = infer_long_short(row)
+        if long_ccy:
+            currencies.add(long_ccy)
+        if short_ccy:
+            currencies.add(short_ccy)
     if "currency" in permission.columns:
-        currencies.update(permission["currency"].dropna().astype(str).str.upper().tolist())
+        currencies.update(
+            value
+            for value in permission["currency"].dropna().astype(str).str.upper().tolist()
+            if value in FX_CURRENCIES
+        )
     if not currencies:
         currencies = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
 
     rows = {currency: {"currency": currency, "strength": 0.0, "ideas": 0} for currency in sorted(currencies)}
     for _, row in signals.iterrows():
-        long_ccy = safe_text(row.get("long_currency", "")).upper()
-        short_ccy = safe_text(row.get("short_currency", "")).upper()
-        if not long_ccy or not short_ccy or long_ccy == "N/A" or short_ccy == "N/A":
+        long_ccy, short_ccy = infer_long_short(row)
+        if not long_ccy or not short_ccy:
             continue
-        score = abs(to_float(row.get("abs_score", row.get("bias_score", 0.0))))
+        score = abs(to_float(row.get("abs_score", row.get("ensemble_final_score", row.get("bias_score", 0.0)))))
         action = safe_text(row.get("ensemble_action", ""))
         weight = {"Research watch only": 1.0, "Context watch": 0.65, "Research / no action": 0.25}.get(action, 0.55)
         contribution = score * weight
@@ -842,11 +882,10 @@ def build_pair_matrix(signals: pd.DataFrame, currencies: list[str]) -> pd.DataFr
     if signals.empty:
         return matrix
     for _, row in signals.iterrows():
-        long_ccy = safe_text(row.get("long_currency", "")).upper()
-        short_ccy = safe_text(row.get("short_currency", "")).upper()
+        long_ccy, short_ccy = infer_long_short(row)
         if long_ccy not in matrix.index or short_ccy not in matrix.columns:
             continue
-        score = abs(to_float(row.get("abs_score", row.get("bias_score", 0.0))))
+        score = abs(to_float(row.get("abs_score", row.get("ensemble_final_score", row.get("bias_score", 0.0)))))
         if abs(score) >= abs(matrix.loc[long_ccy, short_ccy]):
             matrix.loc[long_ccy, short_ccy] = score
             matrix.loc[short_ccy, long_ccy] = -score
@@ -882,17 +921,16 @@ def render_overview_panel(regime: pd.DataFrame, permission: pd.DataFrame) -> Non
     headline = readable_posture(posture)
     body = overview_reason(final_regime, posture, gate, stale, prob_top, bayes_read)
     st.markdown(
-        f"""
-        <div class="overview-panel">
-            <div class="headline">{esc(headline)}</div>
-            <div class="body">{esc(body)}</div>
-            <div class="mini-grid">
-                <div class="mini-stat"><div class="k">Macro Regime</div><div class="v">{esc(final_regime)}</div></div>
-                <div class="mini-stat"><div class="k">Confidence</div><div class="v">{esc(confidence)}/100</div></div>
-                <div class="mini-stat"><div class="k">Clean Currencies</div><div class="v">{clean}/{total}</div></div>
-            </div>
-        </div>
-        """,
+        (
+            '<div class="overview-panel">'
+            f'<div class="headline">{esc(headline)}</div>'
+            f'<div class="body">{esc(body)}</div>'
+            '<div class="mini-grid">'
+            f'<div class="mini-stat"><div class="k">Macro Regime</div><div class="v">{esc(final_regime)}</div></div>'
+            f'<div class="mini-stat"><div class="k">Confidence</div><div class="v">{esc(confidence)}/100</div></div>'
+            f'<div class="mini-stat"><div class="k">Clean Currencies</div><div class="v">{clean}/{total}</div></div>'
+            "</div></div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -914,17 +952,17 @@ def render_pair_cards(signals: pd.DataFrame, limit: int = 4) -> None:
         reason = friendly_reason(safe_text(row.get("ensemble_reason", "")))
         tone = action_tone(safe_text(row.get("ensemble_action", "")))
         cards.append(
-            f"""
-            <div class="pair-card">
-                <div class="pair">{esc(pair)}</div>
-                <div class="idea">{esc(idea)}</div>
-                <div class="score">{score:.2f}</div>
-                <span class="pill pill-{tone}">{esc(status)}</span>
-                <span class="pill pill-info">{esc(use)}</span>
-                <div class="meta">Rates history: {esc(rates)}<br>Real-rate history: {esc(cpi)}</div>
-                <div class="reason">{esc(shorten(reason, 130))}</div>
-            </div>
-            """
+            (
+                '<div class="pair-card">'
+                f'<div class="pair">{esc(pair)}</div>'
+                f'<div class="idea">{esc(idea)}</div>'
+                f'<div class="score">{score:.2f}</div>'
+                f'<span class="pill pill-{tone}">{esc(status)}</span>'
+                f'<span class="pill pill-info">{esc(use)}</span>'
+                f'<div class="meta">Rates history: {esc(rates)}<br>Real-rate history: {esc(cpi)}</div>'
+                f'<div class="reason">{esc(shorten(reason, 130))}</div>'
+                "</div>"
+            )
         )
     st.markdown(f'<div class="pair-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
@@ -1073,14 +1111,14 @@ def currencies_view(frames: Dict[str, pd.DataFrame]) -> None:
         quality = safe_text(row.get("data_quality", "n/a"))
         tone = quality_tone(quality)
         cards.append(
-            f"""
-            <div class="currency-card">
-                <div class="ccy">{esc(row.get("currency"))} / {row.get("strength", 0):.2f}</div>
-                <div class="line">Read: {esc(row.get("read"))}</div>
-                <div class="line">Data: <span class="pill pill-{tone}">{esc(quality)}</span></div>
-                <div class="line">Policy mode: {esc(row.get("policy_mode", "n/a"))}</div>
-            </div>
-            """
+            (
+                '<div class="currency-card">'
+                f'<div class="ccy">{esc(row.get("currency"))} / {row.get("strength", 0):.2f}</div>'
+                f'<div class="line">Read: {esc(row.get("read"))}</div>'
+                f'<div class="line">Data: <span class="pill pill-{tone}">{esc(quality)}</span></div>'
+                f'<div class="line">Policy mode: {esc(row.get("policy_mode", "n/a"))}</div>'
+                "</div>"
+            )
         )
     st.markdown(f'<div class="currency-strip">{"".join(cards)}</div>', unsafe_allow_html=True)
 
@@ -1185,14 +1223,14 @@ def regime_view(frames: Dict[str, pd.DataFrame]) -> None:
             prob_fit = f'{to_float(prob_row.iloc[0].get("semantic_fit_score")):.0f}/100'
     if prob_top not in ["", "n/a", final_regime]:
         st.markdown(
-            f"""
-            <div class="explain-box">
-                <strong>Markov/Bayes warning, not a regime switch.</strong>
-                Scorecard remains primary because the exported driver alignment fits
-                <strong>{esc(final_regime)}</strong> at {esc(scorecard_fit)} while the probabilistic top regime
-                <strong>{esc(prob_top)}</strong> fits the current macro drivers at {esc(prob_fit)}.
-            </div>
-            """,
+            (
+                '<div class="explain-box">'
+                "<strong>Markov/Bayes warning, not a regime switch.</strong> "
+                "Scorecard remains primary because the exported driver alignment fits "
+                f"<strong>{esc(final_regime)}</strong> at {esc(scorecard_fit)} while the probabilistic top regime "
+                f"<strong>{esc(prob_top)}</strong> fits the current macro drivers at {esc(prob_fit)}."
+                "</div>"
+            ),
             unsafe_allow_html=True,
         )
 
