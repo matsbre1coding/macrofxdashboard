@@ -19,7 +19,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.8 Research Cockpit"
+APP_VERSION = "v1.8.1 Research Cockpit"
 
 
 st.set_page_config(
@@ -73,6 +73,21 @@ NARRATIVE_COLUMNS = [
 
 
 FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
+
+
+CURRENCY_DETECTION_TERMS = {
+    "USD": ["USD", "dollar", "US dollar", "U.S. dollar", "DXY", "Fed", "Federal Reserve", "FOMC", "Treasury yields", "Treasury yield", "Treasuries", "greenback"],
+    "EUR": ["EUR", "euro", "ECB", "eurozone", "euro area"],
+    "GBP": ["GBP", "sterling", "pound", "BoE", "UK"],
+    "JPY": ["JPY", "yen", "BoJ", "Japan"],
+    "CHF": ["CHF", "franc", "Swiss franc", "SNB", "Switzerland"],
+    "CAD": ["CAD", "loonie", "Canadian dollar", "BoC", "Canada"],
+    "AUD": ["AUD", "Aussie", "Australian dollar", "RBA", "Australia"],
+    "NZD": ["NZD", "kiwi", "New Zealand dollar", "RBNZ", "New Zealand"],
+}
+
+
+NARRATIVE_SENTIMENT_SCORE = {"Bullish": 1.0, "Bearish": -1.0, "Neutral": 0.0, "Mixed": 0.0}
 
 
 NUMERIC_COLUMN_HINTS = [
@@ -1284,13 +1299,36 @@ def build_pair_hover_text(matrix: pd.DataFrame) -> pd.DataFrame:
     return hover
 
 
+def term_pattern(term: str) -> str:
+    escaped = re.escape(term.lower())
+    escaped = escaped.replace(r"\ ", r"\s+")
+    return rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
+
+
+def text_has_term(text: str, term: str) -> bool:
+    return bool(re.search(term_pattern(term), text.lower()))
+
+
+def text_has_any(text: str, terms: list[str]) -> bool:
+    lowered = safe_text(text, "").lower()
+    return any(text_has_term(lowered, term) for term in terms)
+
+
 def extract_currencies(value: object) -> list[str]:
-    text = safe_text(value, "").upper()
+    text = safe_text(value, "")
     found = []
-    for currency in FX_CURRENCIES:
-        if re.search(rf"\b{currency}\b", text):
+    for currency in sorted(FX_CURRENCIES):
+        terms = CURRENCY_DETECTION_TERMS.get(currency, [currency])
+        if text_has_any(text, terms):
             found.append(currency)
     return found
+
+
+def detected_currency_string(value: object, fallback: object = "") -> str:
+    currencies = extract_currencies(value)
+    if not currencies:
+        currencies = extract_currencies(fallback)
+    return ", ".join(currencies)
 
 
 def normalize_label(value: object, allowed: set[str], default: str) -> str:
@@ -1303,31 +1341,14 @@ def normalize_label(value: object, allowed: set[str], default: str) -> str:
     return default
 
 
-def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def normalize_loaded_narrative_items(frame: pd.DataFrame, dedupe_mode: str = "item") -> pd.DataFrame:
     if frame.empty:
-        return pd.DataFrame(columns=NARRATIVE_COLUMNS)
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "exclusion_reason", "included_in_aggregation"])
     out = frame.copy()
     out.columns = [str(column).strip().lower() for column in out.columns]
     for column in NARRATIVE_COLUMNS:
         if column not in out.columns:
             out[column] = ""
-    out["currency"] = out["currency"].astype(str).str.upper().str.strip()
-
-    exploded_rows = []
-    for _, row in out.iterrows():
-        currencies = extract_currencies(row.get("currency", ""))
-        if not currencies and "detected_currencies" in out.columns:
-            currencies = extract_currencies(row.get("detected_currencies", ""))
-        for currency in currencies:
-            if currency in FX_CURRENCIES:
-                clone = row.copy()
-                clone["currency"] = currency
-                exploded_rows.append(clone)
-    if not exploded_rows:
-        return pd.DataFrame(columns=NARRATIVE_COLUMNS)
-
-    out = pd.DataFrame(exploded_rows)
-    out = out[NARRATIVE_COLUMNS].copy()
     out["sentiment"] = out["sentiment"].apply(lambda value: normalize_label(value, {"Bullish", "Bearish", "Neutral", "Mixed"}, "Neutral"))
     out["confidence"] = out["confidence"].apply(lambda value: normalize_label(value, {"Low", "Medium", "High"}, "Low"))
     out["relevance"] = out["relevance"].apply(
@@ -1338,6 +1359,62 @@ def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
         )
     )
     out["published_dt"] = pd.to_datetime(out["published_at"], errors="coerce", utc=True)
+    out["age_days"] = out["published_dt"].apply(narrative_age_days)
+    detection_columns = [col for col in ["currency", "detected_currencies", "title", "summary", "themes", "supports", "risks", "reason", "source_name"] if col in out.columns]
+    out["detection_text"] = out[detection_columns].astype(str).agg(" ".join, axis=1) if detection_columns else ""
+    out["detected_currencies"] = out["detection_text"].apply(detected_currency_string)
+    out["dedupe_key"] = (
+        out["url"].astype(str).str.strip().str.lower()
+        + "|"
+        + out["title"].astype(str).str.strip().str.lower()
+    )
+    if dedupe_mode == "currency":
+        out["dedupe_key"] = out["dedupe_key"] + "|" + out["currency"].astype(str).str.strip().str.upper()
+    out = out.drop_duplicates("dedupe_key").drop(columns=["dedupe_key"])
+    out["source_item_id"] = range(1, len(out) + 1)
+    out["included_in_aggregation"] = out.apply(
+        lambda row: bool(row.get("detected_currencies")) and to_float(row.get("age_days"), 999.0) <= 14 and row.get("relevance") != "Weak mention",
+        axis=1,
+    )
+    out["exclusion_reason"] = out.apply(narrative_exclusion_reason, axis=1)
+    return out.drop(columns=[col for col in ["detection_text"] if col in out.columns])
+
+
+def narrative_exclusion_reason(row: pd.Series) -> str:
+    detected = safe_text(row.get("detected_currencies", ""), "")
+    age_days = to_float(row.get("age_days"), 999.0)
+    relevance = safe_text(row.get("relevance", ""))
+    sentiment = safe_text(row.get("sentiment", ""))
+    if not detected:
+        return "Excluded: no currency detected"
+    if age_days > 14:
+        return "Excluded from firm read: older than 14 days"
+    if relevance == "Weak mention":
+        return "Weak clue only: currency mention is weak"
+    if sentiment in ["Neutral", "Mixed"]:
+        return "Included as context: no clear directional score"
+    return "Included in aggregation"
+
+
+def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    loaded = normalize_loaded_narrative_items(frame, dedupe_mode="currency")
+    if loaded.empty:
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "weighted_source_score", "exclusion_reason", "included_in_aggregation"])
+
+    exploded_rows = []
+    for _, row in loaded.iterrows():
+        explicit_currencies = extract_currencies(row.get("currency", ""))
+        detected_currencies = extract_currencies(row.get("detected_currencies", ""))
+        currencies = explicit_currencies or detected_currencies
+        for currency in currencies:
+            if currency in FX_CURRENCIES:
+                clone = row.copy()
+                clone["currency"] = currency
+                exploded_rows.append(clone)
+    if not exploded_rows:
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "weighted_source_score", "exclusion_reason", "included_in_aggregation"])
+
+    out = pd.DataFrame(exploded_rows)
     out["dedupe_key"] = (
         out["url"].astype(str).str.strip().str.lower()
         + "|"
@@ -1421,14 +1498,23 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "main_themes": "n/a",
                 "supporting_arguments": "n/a",
                 "opposing_arguments": "n/a",
+                "weak_clues": "n/a",
+                "loaded_source_titles": "n/a",
+                "why_no_firm_read": "No public narrative data loaded for this currency.",
+                "used_source_count": 0,
+                "fresh_source_count": 0,
                 "narrative_vs_dashboard": "Not enough data",
             }
         )
         return empty_summary, details
 
     details = details.copy()
-    details["age_days"] = details["published_dt"].apply(narrative_age_days)
+    if "age_days" not in details.columns:
+        details["age_days"] = details["published_dt"].apply(narrative_age_days)
     details["weighted_source_score"] = details.apply(narrative_weighted_score, axis=1).round(3)
+    if "included_in_aggregation" not in details.columns:
+        details["included_in_aggregation"] = details["age_days"].le(14) & details["detected_currencies"].astype(str).ne("") & details["relevance"].astype(str).ne("Weak mention")
+    details["exclusion_reason"] = details.apply(narrative_exclusion_reason, axis=1)
 
     strength_map = {}
     if not strength.empty and {"currency", "strength"}.issubset(strength.columns):
@@ -1438,18 +1524,20 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
     for currency in sorted(FX_CURRENCIES):
         rows = details[details["currency"].eq(currency)].copy()
         fresh_rows = rows[rows["age_days"].le(14)]
-        working = fresh_rows if not fresh_rows.empty else rows
-        source_count = int(len(working))
+        used_rows = rows[to_bool_series(rows["included_in_aggregation"])] if not rows.empty else rows
+        working = used_rows if not used_rows.empty else (fresh_rows if not fresh_rows.empty else rows)
+        source_count = int(len(rows))
         fresh_count = int(len(fresh_rows))
+        used_count = int(len(used_rows))
         bullish_sources = int(working["sentiment"].eq("Bullish").sum())
         bearish_sources = int(working["sentiment"].eq("Bearish").sum())
         neutral_mixed_sources = int(working["sentiment"].isin(["Neutral", "Mixed"]).sum())
-        weighted_score = float(working["weighted_source_score"].sum()) if not working.empty else 0.0
+        weighted_score = float(used_rows["weighted_source_score"].sum()) if not used_rows.empty else 0.0
         bull_weight = float(working.loc[working["weighted_source_score"] > 0, "weighted_source_score"].sum()) if not working.empty else 0.0
         bear_weight = abs(float(working.loc[working["weighted_source_score"] < 0, "weighted_source_score"].sum())) if not working.empty else 0.0
         contradiction = bull_weight > 0.75 and bear_weight > 0.75 and min(bull_weight, bear_weight) / max(bull_weight, bear_weight) > 0.35
 
-        if source_count < 2 or fresh_count < 2:
+        if used_count < 2:
             sentiment = "Not enough data"
         elif contradiction:
             sentiment = "Mixed"
@@ -1464,9 +1552,9 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
 
         if sentiment == "Not enough data":
             confidence = "Low"
-        elif abs(weighted_score) >= 2.5 and fresh_count >= 4 and not contradiction:
+        elif abs(weighted_score) >= 2.5 and used_count >= 4 and not contradiction:
             confidence = "High"
-        elif abs(weighted_score) >= 1.0 and fresh_count >= 2:
+        elif abs(weighted_score) >= 1.0 and used_count >= 2:
             confidence = "Medium"
         else:
             confidence = "Low"
@@ -1486,8 +1574,23 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         themes = split_theme_tokens(working["themes"]) if not working.empty else []
         top_themes = pd.Series(themes).value_counts().head(4).index.tolist() if themes else []
         latest_date = "n/a"
-        if not working.empty and working["published_dt"].notna().any():
-            latest_date = str(working["published_dt"].max().date())
+        if not rows.empty and rows["published_dt"].notna().any():
+            latest_date = str(rows["published_dt"].max().date())
+        weak_clues = top_texts(rows.sort_values("age_days"), ["title", "summary", "reason"], limit=3) if not rows.empty else "n/a"
+        loaded_titles = top_texts(rows.sort_values("age_days"), ["title"], limit=4) if not rows.empty else "n/a"
+        if used_count < 2:
+            if rows.empty:
+                why_no_firm_read = "No loaded source detected this currency."
+            elif fresh_count < 2:
+                why_no_firm_read = f"Only {fresh_count} fresh detected item(s); at least 2 good fresh sources are required."
+            else:
+                why_no_firm_read = f"Only {used_count} good item(s) after weak-mention and freshness filters; at least 2 are required."
+        elif contradiction:
+            why_no_firm_read = "Bullish and bearish public evidence both matter, so the read stays mixed."
+        elif sentiment in ["Neutral", "Mixed"]:
+            why_no_firm_read = "Loaded sources do not produce a clear directional public narrative."
+        else:
+            why_no_firm_read = "A directional narrative exists, but it remains research context only."
 
         summary_rows.append(
             {
@@ -1500,9 +1603,14 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "neutral_mixed_sources": neutral_mixed_sources,
                 "latest_source_date": latest_date,
                 "source_count": source_count,
+                "fresh_source_count": fresh_count,
+                "used_source_count": used_count,
                 "main_themes": ", ".join(top_themes) if top_themes else "n/a",
                 "supporting_arguments": top_texts(working[working["weighted_source_score"] > 0].sort_values("weighted_source_score", ascending=False), ["supports", "summary", "reason"]),
                 "opposing_arguments": top_texts(working[working["weighted_source_score"] < 0].sort_values("weighted_source_score"), ["risks", "summary", "reason"]),
+                "weak_clues": weak_clues,
+                "loaded_source_titles": loaded_titles,
+                "why_no_firm_read": why_no_firm_read,
                 "narrative_vs_dashboard": narrative_vs_dashboard,
             }
         )
@@ -1522,60 +1630,140 @@ def narrative_tone(sentiment: str) -> str:
     return "info"
 
 
+def classify_relevance(source_type: str, text: str, detected_from_text: bool) -> str:
+    if not detected_from_text:
+        return "Weak mention"
+    if any(term in text for term in ["currency", "fx", "foreign exchange", "dollar", "yen", "sterling", "euro", "aussie", "kiwi", "loonie"]):
+        return "Currency-specific"
+    if any(term in text for term in ["central bank", "rates", "rate", "yield", "inflation", "cpi", "fomc", "ecb", "boe", "boj", "boc", "rba", "rbnz", "snb"]):
+        return "Direct macro-policy relevance"
+    if "Central bank" in source_type or "Official" in source_type:
+        return "Direct macro-policy relevance"
+    return "General market commentary"
+
+
+def classify_currency_sentiment(currency: str, text: str) -> tuple[str, str, str, str, str, str]:
+    support: list[str] = []
+    risk: list[str] = []
+    themes: list[str] = []
+
+    hawkish = text_has_any(text, ["hawkish", "higher yields", "higher rates", "rising yields", "yields rise", "yields rose", "tightening", "rate hike", "restrictive policy"])
+    dovish = text_has_any(text, ["dovish", "rate cuts", "rate cut", "cut rates", "lower yields", "lower rates", "easing", "policy easing"])
+    hot_inflation = text_has_any(text, ["hot inflation", "sticky inflation", "inflation pressure", "higher inflation", "above-target inflation", "price pressures"])
+    weak_growth = text_has_any(text, ["weak growth", "growth weakness", "slowdown", "recession", "contraction", "stagnation", "downturn"])
+    risk_off = text_has_any(text, ["risk-off", "risk off", "risk aversion", "safe haven", "market stress", "volatility spike", "liquidity stress"])
+    risk_on = text_has_any(text, ["risk-on", "risk on", "risk appetite", "soft landing", "equities rally", "carry demand"])
+    commodity_strength = text_has_any(text, ["commodity strength", "commodities higher", "higher commodities", "higher oil", "oil strength", "higher metals", "metals rally"])
+    oil_weakness = text_has_any(text, ["oil weakness", "lower oil", "oil prices fall", "oil prices fell", "weaker oil", "oil selloff"])
+
+    if hawkish:
+        support.append("hawkish central bank / higher yields can support the currency")
+        themes.append("rates")
+    if dovish:
+        risk.append("dovish central bank / rate-cut pressure can weigh on the currency")
+        themes.append("rates")
+    if hot_inflation:
+        if weak_growth:
+            support.append("hot inflation can support rates")
+            risk.append("weak growth makes the inflation signal mixed")
+        else:
+            support.append("hot inflation can support the currency through rates expectations")
+        themes.append("inflation")
+    if weak_growth:
+        risk.append("weak growth / recession language can pressure the currency")
+        themes.append("growth")
+    if risk_off:
+        themes.append("risk-off")
+        if currency in ["JPY", "CHF"]:
+            support.append("risk-off language can support safe-haven currencies")
+        elif currency in ["AUD", "NZD", "CAD"]:
+            risk.append("risk-off language can pressure high-beta / commodity-linked currencies")
+        elif currency == "USD":
+            support.append("risk-off language can support USD liquidity demand")
+            risk.append("risk-off can also conflict with growth-sensitive USD narratives")
+    if risk_on:
+        themes.append("risk-on")
+        if currency in ["AUD", "NZD", "CAD"]:
+            support.append("risk-on language can support high-beta / commodity-linked currencies")
+        elif currency in ["JPY", "CHF"]:
+            risk.append("risk-on language can reduce safe-haven demand")
+    if commodity_strength:
+        themes.append("commodities")
+        if currency in ["CAD", "AUD"]:
+            support.append("commodity strength can support CAD/AUD")
+    if oil_weakness and currency == "CAD":
+        themes.append("oil")
+        risk.append("oil weakness can pressure CAD")
+
+    support = list(dict.fromkeys(support))
+    risk = list(dict.fromkeys(risk))
+    themes = list(dict.fromkeys(themes)) or ["public commentary"]
+
+    if support and risk:
+        sentiment = "Mixed"
+    elif support:
+        sentiment = "Bullish"
+    elif risk:
+        sentiment = "Bearish"
+    else:
+        sentiment = "Neutral"
+
+    evidence_count = len(support) + len(risk)
+    if sentiment in ["Bullish", "Bearish"] and evidence_count >= 2:
+        confidence = "Medium"
+    elif sentiment == "Mixed" and evidence_count >= 2:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    reason = "No strong directional FX rule matched; kept as public context."
+    if sentiment != "Neutral":
+        reason = " | ".join((support + risk)[:3])
+    return sentiment, confidence, "; ".join(themes), " | ".join(support), " | ".join(risk), reason
+
+
 def classify_public_item(source: dict, title: str, summary: str, published_at: str, url: str) -> list[dict]:
-    text = f"{title} {summary}".lower()
-    currency_terms = {
-        "USD": ["usd", "dollar", "fed", "treasury", "us rates", "fomc"],
-        "EUR": ["eur", "euro", "ecb", "euro area"],
-        "GBP": ["gbp", "sterling", "pound", "boe", "uk"],
-        "JPY": ["jpy", "yen", "boj", "japan"],
-        "CHF": ["chf", "franc", "snb", "switzerland"],
-        "CAD": ["cad", "canadian dollar", "boc", "canada"],
-        "AUD": ["aud", "australian dollar", "rba", "australia"],
-        "NZD": ["nzd", "new zealand dollar", "rbnz", "new zealand"],
-    }
-    detected = [currency for currency, terms in currency_terms.items() if any(term in text for term in terms)]
+    source_name = safe_text(source.get("source_name", "Unknown source"))
+    source_type = safe_text(source.get("source_type", "Public commentary"))
     coverage = safe_text(source.get("coverage", "")).upper()
+    content_text = f"{title} {summary}".lower()
+    source_context = f"{source_name} {coverage}".lower()
+    text = f"{content_text} {source_context}"
+    detected = extract_currencies(text)
+    detected_from_text = bool(extract_currencies(content_text))
     if not detected and coverage in FX_CURRENCIES:
         detected = [coverage]
     if not detected:
         return []
 
-    bullish_terms = ["stronger", "strength", "hawkish", "tightening", "higher rates", "sticky inflation", "resilient growth", "safe haven demand"]
-    bearish_terms = ["weaker", "weakness", "dovish", "rate cuts", "lower rates", "slowdown", "recession", "risk appetite improves", "easing"]
-    bullish_hits = sum(term in text for term in bullish_terms)
-    bearish_hits = sum(term in text for term in bearish_terms)
-    if bullish_hits and bearish_hits:
-        sentiment = "Mixed"
-    elif bullish_hits:
-        sentiment = "Bullish"
-    elif bearish_hits:
-        sentiment = "Bearish"
-    else:
-        sentiment = "Neutral"
-
-    source_type = safe_text(source.get("source_type", "Public commentary"))
-    relevance = "Direct macro-policy relevance" if "Central bank" in source_type or "Official" in source_type else "General market commentary"
-    confidence = "Medium" if sentiment in ["Bullish", "Bearish"] and relevance != "General market commentary" else "Low"
-    return [
-        {
-            "currency": currency,
-            "source_name": source.get("source_name", "Unknown source"),
-            "source_type": source_type,
-            "title": title,
-            "url": url,
-            "published_at": published_at,
-            "summary": shorten(summary, 260),
-            "sentiment": sentiment,
-            "confidence": confidence,
-            "relevance": relevance,
-            "themes": "public commentary",
-            "supports": "",
-            "risks": "",
-            "reason": "Simple keyword-based public-source MVP classification. Treat as research context only.",
-        }
-        for currency in detected
-    ]
+    relevance = classify_relevance(source_type, text, detected_from_text or coverage in FX_CURRENCIES)
+    if coverage in FX_CURRENCIES and any(label in source_type.lower() for label in ["central bank", "official"]):
+        relevance = "Direct macro-policy relevance"
+    rows = []
+    for currency in detected:
+        sentiment, confidence, themes, supports, risks, reason = classify_currency_sentiment(currency, text)
+        if relevance == "Weak mention" and confidence == "Medium":
+            confidence = "Low"
+        rows.append(
+            {
+                "currency": currency,
+                "detected_currencies": ", ".join(detected),
+                "source_name": source_name,
+                "source_type": source_type,
+                "title": title,
+                "url": url,
+                "published_at": published_at,
+                "summary": shorten(summary, 260),
+                "sentiment": sentiment,
+                "confidence": confidence,
+                "relevance": relevance,
+                "themes": themes,
+                "supports": supports,
+                "risks": risks,
+                "reason": reason,
+            }
+        )
+    return rows
 
 
 def clean_feed_text(value: object) -> str:
@@ -1596,10 +1784,10 @@ def parse_feed_date(value: object) -> str:
         return "" if pd.isna(parsed) else parsed.isoformat()
 
 
-def fetch_feed_items(source: dict, per_source_limit: int = 6) -> list[dict]:
+def fetch_feed_items(source: dict, per_source_limit: int = 6) -> tuple[list[dict], list[dict]]:
     feed_url = safe_text(source.get("feed_url", ""), "")
     if not feed_url:
-        return []
+        return [], []
     request = urllib.request.Request(feed_url, headers={"User-Agent": "MacroFXCockpitPublicNarrativeMonitor/1.0"})
     with urllib.request.urlopen(request, timeout=8) as response:
         payload = response.read()
@@ -1608,7 +1796,8 @@ def fetch_feed_items(source: dict, per_source_limit: int = 6) -> list[dict]:
     if not items:
         items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
 
-    rows = []
+    raw_rows = []
+    classified_rows = []
     for item in items[:per_source_limit]:
         title = clean_feed_text(item.findtext("title") or item.findtext("{http://www.w3.org/2005/Atom}title"))
         summary = clean_feed_text(
@@ -1628,19 +1817,54 @@ def fetch_feed_items(source: dict, per_source_limit: int = 6) -> list[dict]:
             or item.findtext("{http://www.w3.org/2005/Atom}published")
             or item.findtext("{http://www.w3.org/2005/Atom}updated")
         )
-        rows.extend(classify_public_item(source, title, summary, published_at, link or safe_text(source.get("url", ""))))
-    return rows
+        url = link or safe_text(source.get("url", ""))
+        source_context = f"{safe_text(source.get('source_name', ''))} {safe_text(source.get('coverage', ''))}"
+        detection_text = f"{title} {summary} {source_context}"
+        detected = detected_currency_string(detection_text)
+        source_type = safe_text(source.get("source_type", "Public commentary"))
+        coverage = safe_text(source.get("coverage", "")).upper()
+        relevance = classify_relevance(source_type, detection_text.lower(), bool(extract_currencies(f"{title} {summary}")) or coverage in FX_CURRENCIES)
+        if coverage in FX_CURRENCIES and any(label in source_type.lower() for label in ["central bank", "official"]):
+            relevance = "Direct macro-policy relevance"
+        raw_rows.append(
+            {
+                "currency": detected,
+                "detected_currencies": detected,
+                "source_name": source.get("source_name", "Unknown source"),
+                "source_type": source_type,
+                "title": title,
+                "url": url,
+                "published_at": published_at,
+                "summary": shorten(summary, 320),
+                "sentiment": "Neutral",
+                "confidence": "Low",
+                "relevance": relevance,
+                "themes": "public commentary",
+                "supports": "",
+                "risks": "",
+                "reason": "Raw fetched public item. Classification happens per detected currency.",
+            }
+        )
+        classified_rows.extend(classify_public_item(source, title, summary, published_at, url))
+    return raw_rows, classified_rows
 
 
 @st.cache_data(ttl=14400, show_spinner=False)
-def fetch_public_narratives(refresh_token: int) -> tuple[pd.DataFrame, list[dict], str]:
+def fetch_public_narratives(refresh_token: int) -> tuple[pd.DataFrame, list[dict], str, dict, pd.DataFrame]:
     rows = []
+    raw_rows = []
     failures = []
+    attempted = 0
+    successful = 0
     for source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
         if not source.get("fetch_enabled"):
             continue
+        attempted += 1
         try:
-            rows.extend(fetch_feed_items(source, per_source_limit=6))
+            source_raw, source_rows = fetch_feed_items(source, per_source_limit=6)
+            raw_rows.extend(source_raw)
+            rows.extend(source_rows)
+            successful += 1
         except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError, TimeoutError, OSError) as exc:
             failures.append(
                 {
@@ -1654,7 +1878,22 @@ def fetch_public_narratives(refresh_token: int) -> tuple[pd.DataFrame, list[dict
             rows = rows[:120]
             break
     refreshed_at = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
-    return pd.DataFrame(rows), failures, refreshed_at
+    raw_frame = pd.DataFrame(raw_rows)
+    classified_frame = pd.DataFrame(rows)
+    normalized_raw = normalize_loaded_narrative_items(raw_frame)
+    normalized_details = normalize_narrative_frame(classified_frame)
+    diagnostics = {
+        "sources_configured": len(PUBLIC_NARRATIVE_SOURCE_REGISTRY),
+        "sources_attempted": attempted,
+        "sources_successful": successful,
+        "sources_failed": len(failures),
+        "items_fetched": len(raw_rows),
+        "items_after_dedupe": len(normalized_raw),
+        "items_after_freshness_filter": int(normalized_raw["age_days"].le(14).sum()) if not normalized_raw.empty and "age_days" in normalized_raw.columns else 0,
+        "items_with_detected_currencies": int(normalized_raw["detected_currencies"].astype(str).str.len().gt(0).sum()) if not normalized_raw.empty and "detected_currencies" in normalized_raw.columns else 0,
+        "items_used_in_aggregation": int(to_bool_series(normalized_details["included_in_aggregation"]).sum()) if not normalized_details.empty and "included_in_aggregation" in normalized_details.columns else 0,
+    }
+    return classified_frame, failures, refreshed_at, diagnostics, normalized_raw
 
 
 def simplified_signals(signals: pd.DataFrame) -> pd.DataFrame:
@@ -2184,8 +2423,11 @@ def render_narrative_cards(summary: pd.DataFrame) -> None:
                 f'<span class="pill pill-{tone if tone in ["good", "bad", "info"] else "watch"}">{esc(row.get("confidence", "Low"))} confidence</span>'
                 f'<div class="line">Weighted narrative score: <strong>{to_float(row.get("weighted_score")):+.2f}</strong></div>'
                 f'<div class="line">Sources: {esc(row.get("source_count", 0))} | Latest: {esc(row.get("latest_source_date", "n/a"))}</div>'
+                f'<div class="line">Used / fresh: {esc(row.get("used_source_count", 0))} / {esc(row.get("fresh_source_count", 0))}</div>'
                 f'<div class="line">Bullish / Bearish / Neutral-Mixed: {esc(row.get("bullish_sources", 0))} / {esc(row.get("bearish_sources", 0))} / {esc(row.get("neutral_mixed_sources", 0))}</div>'
                 f'<div class="label">Main themes</div><div class="mini">{esc(shorten(row.get("main_themes", "n/a"), 130))}</div>'
+                f'<div class="label">Weak clues</div><div class="mini">{esc(shorten(row.get("weak_clues", "n/a"), 150))}</div>'
+                f'<div class="label">Why no firm read?</div><div class="mini">{esc(shorten(row.get("why_no_firm_read", "n/a"), 150))}</div>'
                 f'<div class="label">Narrative vs Dashboard</div><div class="mini">{esc(dashboard_read)}</div>'
                 "</div>"
             )
@@ -2193,8 +2435,46 @@ def render_narrative_cards(summary: pd.DataFrame) -> None:
     st.markdown(f'<div class="narrative-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
 
 
-def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFrame) -> None:
+def render_fetch_diagnostics(diagnostics: dict, failures: list[dict]) -> None:
+    st.markdown("#### Fetch diagnostics")
+    diagnostic_cards = [
+        status_card("Sources configured", diagnostics.get("sources_configured", len(PUBLIC_NARRATIVE_SOURCE_REGISTRY)), "Curated public source registry.", "info"),
+        status_card("Sources attempted", diagnostics.get("sources_attempted", 0), "Only fetch-enabled sources are attempted.", "info"),
+        status_card("Sources successful", diagnostics.get("sources_successful", 0), "Returned a readable feed/API response.", "good" if diagnostics.get("sources_successful", 0) else "watch"),
+        status_card("Sources failed", diagnostics.get("sources_failed", len(failures)), "Errors are shown below.", "bad" if failures else "good"),
+        status_card("Items fetched", diagnostics.get("items_fetched", 0), "Raw public-source items before classification.", "info"),
+        status_card("Items after dedupe", diagnostics.get("items_after_dedupe", 0), "Unique by URL/title.", "info"),
+        status_card("Fresh items", diagnostics.get("items_after_freshness_filter", 0), "Within the 14-day narrative window.", "good" if diagnostics.get("items_after_freshness_filter", 0) else "watch"),
+        status_card("Detected currencies", diagnostics.get("items_with_detected_currencies", 0), "Items with at least one FX currency clue.", "good" if diagnostics.get("items_with_detected_currencies", 0) else "watch"),
+        status_card("Used in aggregation", diagnostics.get("items_used_in_aggregation", 0), "Fresh, detected and not weak mention.", "good" if diagnostics.get("items_used_in_aggregation", 0) else "watch"),
+    ]
+    render_status_grid(diagnostic_cards)
+    if failures:
+        with st.expander("Failed source errors", expanded=False):
+            render_dataframe(pd.DataFrame(failures), height=260)
+
+
+def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFrame, all_items: pd.DataFrame) -> None:
     st.markdown("#### Source details")
+    if not all_items.empty:
+        show_cols = [
+            col
+            for col in [
+                "source_name",
+                "source_type",
+                "title",
+                "published_at",
+                "detected_currencies",
+                "sentiment",
+                "confidence",
+                "relevance",
+                "exclusion_reason",
+                "url",
+            ]
+            if col in all_items.columns
+        ]
+        with st.expander("All loaded source items, including excluded items", expanded=False):
+            render_dataframe(all_items[show_cols], height=420)
     for currency in summary.sort_values("currency")["currency"].tolist():
         rows = details[details["currency"].eq(currency)].copy() if not details.empty and "currency" in details.columns else pd.DataFrame()
         label = f"{currency} sources"
@@ -2214,8 +2494,9 @@ def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFra
                     (
                         f"{link}\n\n"
                         f"Source: `{esc(row.get('source_name', 'n/a'))}` | Type: `{esc(row.get('source_type', 'n/a'))}` | Date: `{esc(date_text)}`  \n"
-                        f"Detected currency: `{esc(row.get('currency'))}` | Sentiment: `{esc(row.get('sentiment'))}` | "
+                        f"Detected currencies: `{esc(row.get('detected_currencies', row.get('currency')))} ` | Item currency: `{esc(row.get('currency'))}` | Sentiment: `{esc(row.get('sentiment'))}` | "
                         f"Confidence: `{esc(row.get('confidence'))}` | Relevance: `{esc(row.get('relevance'))}`  \n"
+                        f"Exclusion reason: `{esc(row.get('exclusion_reason', 'n/a'))}`  \n"
                         f"Summary: {esc(shorten(row.get('summary', 'n/a'), 220))}  \n"
                         f"Reason: {esc(shorten(row.get('reason', 'n/a'), 180))}"
                     ),
@@ -2244,6 +2525,10 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.session_state["narrative_failures"] = []
     if "narrative_refreshed_at" not in st.session_state:
         st.session_state["narrative_refreshed_at"] = ""
+    if "narrative_raw_items" not in st.session_state:
+        st.session_state["narrative_raw_items"] = pd.DataFrame()
+    if "narrative_diagnostics" not in st.session_state:
+        st.session_state["narrative_diagnostics"] = {}
 
     cols = st.columns([0.8, 0.2])
     with cols[0]:
@@ -2259,19 +2544,29 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         if enable_live_fetch:
             st.session_state["narrative_refresh_token"] += 1
             with st.spinner("Refreshing public narrative sources..."):
-                live_frame, failures, refreshed_at = fetch_public_narratives(st.session_state["narrative_refresh_token"])
+                live_frame, failures, refreshed_at, diagnostics, raw_items = fetch_public_narratives(st.session_state["narrative_refresh_token"])
             st.session_state["narrative_live_frame"] = live_frame
             st.session_state["narrative_failures"] = failures
             st.session_state["narrative_refreshed_at"] = refreshed_at
+            st.session_state["narrative_diagnostics"] = diagnostics
+            st.session_state["narrative_raw_items"] = raw_items
             if live_frame.empty:
                 st.warning("Live public-source refresh returned no usable narrative rows. CSV/JSON data or the empty state remains available.")
         else:
             st.info("Live fetching is disabled. Upload narrative_monitor.csv/json or enable experimental fetching before refreshing.")
 
     live_narrative = st.session_state.get("narrative_live_frame", pd.DataFrame())
-    narrative = live_narrative if isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty else csv_narrative
-    data_source = "Live public-source cache" if isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty else "Uploaded/local CSV or JSON"
+    live_raw_items = st.session_state.get("narrative_raw_items", pd.DataFrame())
+    has_live_narrative = isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty
+    has_live_raw = isinstance(live_raw_items, pd.DataFrame) and not live_raw_items.empty
+    has_live_attempt = bool(st.session_state.get("narrative_refreshed_at"))
+    narrative = live_narrative if has_live_narrative else csv_narrative
+    data_source = "Live public-source cache" if (has_live_narrative or has_live_raw or has_live_attempt) else "Uploaded/local CSV or JSON"
     summary, details = aggregate_public_narratives(narrative, strength)
+    if data_source == "Live public-source cache" and has_live_raw:
+        all_items = live_raw_items.copy()
+    else:
+        all_items = normalize_loaded_narrative_items(narrative)
 
     source_count = int(details["url"].astype(str).nunique()) if not details.empty and "url" in details.columns else 0
     fresh_count = int(details["age_days"].le(14).sum()) if not details.empty and "age_days" in details.columns else 0
@@ -2291,8 +2586,25 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
     else:
         st.caption(f"Data source: {data_source}")
 
+    diagnostics = st.session_state.get("narrative_diagnostics", {})
+    if data_source != "Live public-source cache" or not diagnostics:
+        diagnostics = {
+            "sources_configured": len(PUBLIC_NARRATIVE_SOURCE_REGISTRY),
+            "sources_attempted": 0,
+            "sources_successful": 0,
+            "sources_failed": len(st.session_state.get("narrative_failures", [])),
+            "items_fetched": len(narrative),
+            "items_after_dedupe": len(all_items),
+            "items_after_freshness_filter": int(all_items["age_days"].le(14).sum()) if not all_items.empty and "age_days" in all_items.columns else 0,
+            "items_with_detected_currencies": int(all_items["detected_currencies"].astype(str).str.len().gt(0).sum()) if not all_items.empty and "detected_currencies" in all_items.columns else 0,
+            "items_used_in_aggregation": int(to_bool_series(details["included_in_aggregation"]).sum()) if not details.empty and "included_in_aggregation" in details.columns else 0,
+        }
+    render_fetch_diagnostics(diagnostics, st.session_state.get("narrative_failures", []))
+
     if details.empty:
         st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or enable public-source fetching later.")
+        if not all_items.empty:
+            render_narrative_source_expanders(summary, details, all_items)
         with st.expander("Curated source registry", expanded=True):
             registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
             render_dataframe(registry[["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled"]], height=420)
@@ -2300,7 +2612,7 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     st.markdown("#### Currency narrative read")
     render_narrative_cards(summary)
-    render_narrative_source_expanders(summary, details)
+    render_narrative_source_expanders(summary, details, all_items)
 
     failures = st.session_state.get("narrative_failures", [])
     if failures:
