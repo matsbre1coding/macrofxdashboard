@@ -6,6 +6,7 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -19,7 +20,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.8.1 Research Cockpit"
+APP_VERSION = "v1.9 Public Narrative Cockpit"
 
 
 st.set_page_config(
@@ -61,14 +62,24 @@ NARRATIVE_COLUMNS = [
     "title",
     "url",
     "published_at",
+    "snippet_or_summary",
     "summary",
+    "detected_currencies",
+    "driver_tags",
+    "direction",
     "sentiment",
     "confidence",
     "relevance",
+    "horizon",
+    "evidence_strength",
     "themes",
     "supports",
     "risks",
     "reason",
+    "included_in_aggregation",
+    "exclusion_reason",
+    "retrieval_source",
+    "content_depth",
 ]
 
 
@@ -88,6 +99,76 @@ CURRENCY_DETECTION_TERMS = {
 
 
 NARRATIVE_SENTIMENT_SCORE = {"Bullish": 1.0, "Bearish": -1.0, "Neutral": 0.0, "Mixed": 0.0}
+
+
+PUBLIC_NARRATIVE_LOOKBACK_DAYS = 30
+PUBLIC_NARRATIVE_CACHE_TTL_SECONDS = 21600
+GOOGLE_CSE_RESULTS_PER_QUERY = 5
+GOOGLE_CSE_MAX_RESULTS_PER_REFRESH = 120
+
+
+PUBLIC_NARRATIVE_QUERIES = {
+    "USD": [
+        "US dollar outlook forex Fed rates",
+        "DXY dollar sentiment inflation yields",
+        "USD bullish bearish macro outlook",
+    ],
+    "EUR": [
+        "euro outlook forex ECB rates",
+        "EUR bullish bearish eurozone inflation",
+        "euro currency sentiment analysts",
+    ],
+    "GBP": [
+        "sterling pound outlook forex BoE rates",
+        "GBP bullish bearish UK inflation",
+        "pound currency sentiment analysts",
+    ],
+    "JPY": [
+        "Japanese yen outlook forex BoJ yields",
+        "JPY bullish bearish safe haven",
+        "yen currency sentiment analysts",
+    ],
+    "CHF": [
+        "Swiss franc outlook forex SNB rates",
+        "CHF bullish bearish safe haven",
+        "franc currency sentiment analysts",
+    ],
+    "CAD": [
+        "Canadian dollar outlook forex BoC oil",
+        "CAD bullish bearish loonie rates",
+        "Canadian dollar sentiment oil analysts",
+    ],
+    "AUD": [
+        "Australian dollar outlook forex RBA China commodities",
+        "AUD bullish bearish Aussie rates",
+        "Australian dollar sentiment analysts",
+    ],
+    "NZD": [
+        "New Zealand dollar outlook forex RBNZ rates",
+        "NZD bullish bearish kiwi",
+        "New Zealand dollar sentiment analysts",
+    ],
+}
+
+
+NARRATIVE_DRIVER_TERMS = {
+    "rates": ["rate", "rates", "yield", "yields", "Treasury", "bond yield", "cash rate"],
+    "central_bank": ["Fed", "FOMC", "ECB", "BoE", "BoJ", "SNB", "BoC", "RBA", "RBNZ", "central bank"],
+    "inflation": ["inflation", "CPI", "price pressure", "sticky prices"],
+    "growth": ["growth", "GDP", "recession", "slowdown", "contraction", "activity"],
+    "labor": ["labor", "labour", "jobs", "payrolls", "unemployment", "wages"],
+    "risk_on": ["risk-on", "risk on", "risk appetite", "soft landing", "equities rally"],
+    "risk_off": ["risk-off", "risk off", "risk aversion", "market stress", "volatility"],
+    "safe_haven": ["safe haven", "safe-haven", "haven demand"],
+    "commodities": ["commodity", "commodities", "metals", "copper", "iron ore"],
+    "oil": ["oil", "crude", "WTI", "Brent"],
+    "China": ["China", "Chinese", "PBOC"],
+    "fiscal": ["fiscal", "budget", "debt ceiling", "deficit"],
+    "political_risk": ["election", "political", "geopolitical", "tariff"],
+    "positioning": ["positioning", "crowded", "speculative", "CFTC"],
+    "technicals": ["technical", "support level", "resistance", "moving average"],
+    "data_surprise": ["surprise", "beat expectations", "missed expectations", "stronger than expected", "weaker than expected"],
+}
 
 
 NUMERIC_COLUMN_HINTS = [
@@ -279,6 +360,12 @@ PUBLIC_NARRATIVE_SOURCE_REGISTRY = [
     {"source_name": "PIMCO Insights", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://www.pimco.com/en-us/insights", "feed_url": "", "fetch_enabled": False},
     {"source_name": "State Street Global Markets Insights", "source_type": "Public asset-manager commentary", "coverage": "Global", "url": "https://www.statestreet.com/us/en/asset-manager/insights", "feed_url": "", "fetch_enabled": False},
 ]
+
+for _source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
+    if _source.get("fetch_enabled"):
+        _source.setdefault("disabled_reason", "")
+    else:
+        _source.setdefault("disabled_reason", "No stable public RSS/API endpoint configured; use Google CSE/GDELT instead of aggressive scraping.")
 
 
 def inject_css() -> None:
@@ -1316,10 +1403,20 @@ def text_has_any(text: str, terms: list[str]) -> bool:
 
 def extract_currencies(value: object) -> list[str]:
     text = safe_text(value, "")
+    lowered = text.lower()
     found = []
     for currency in sorted(FX_CURRENCIES):
         terms = CURRENCY_DETECTION_TERMS.get(currency, [currency])
-        if text_has_any(text, terms):
+        matched = False
+        for term in terms:
+            term_l = term.lower()
+            if currency == "USD" and term_l == "dollar":
+                if any(phrase in lowered for phrase in ["canadian dollar", "australian dollar", "new zealand dollar"]):
+                    continue
+            if text_has_term(text, term):
+                matched = True
+                break
+        if matched:
             found.append(currency)
     return found
 
@@ -1341,28 +1438,114 @@ def normalize_label(value: object, allowed: set[str], default: str) -> str:
     return default
 
 
+def normalize_relevance(value: object) -> str:
+    text = safe_text(value, "General market commentary").strip()
+    mapping = {
+        "currency-specific": "Direct FX/currency outlook",
+        "direct fx/currency outlook": "Direct FX/currency outlook",
+        "direct macro-policy relevance": "Direct macro-policy relevance",
+        "general market commentary": "General market commentary",
+        "weak mention": "Weak mention",
+    }
+    return mapping.get(text.lower(), "General market commentary")
+
+
+def read_secret_or_env(name: str) -> str:
+    value = os.getenv(name, "")
+    try:
+        secret_value = st.secrets.get(name, "")
+        if secret_value:
+            value = str(secret_value)
+    except Exception:
+        pass
+    return safe_text(value, "").strip()
+
+
+def has_google_cse_credentials() -> bool:
+    return bool(read_secret_or_env("GOOGLE_SEARCH_API_KEY") and read_secret_or_env("GOOGLE_SEARCH_ENGINE_ID"))
+
+
+def source_domain(url: object) -> str:
+    parsed = urllib.parse.urlparse(safe_text(url, ""))
+    domain = parsed.netloc or safe_text(url, "")
+    return domain.replace("www.", "") or "unknown source"
+
+
+def narrative_age_days(value: object) -> float:
+    if value is None or pd.isna(value):
+        return 999.0
+    published = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(published):
+        return 999.0
+    return max((pd.Timestamp.now(tz="UTC") - published).total_seconds() / 86400.0, 0.0)
+
+
+def narrative_exclusion_reason(row: pd.Series) -> str:
+    detected = safe_text(row.get("detected_currencies", ""), "")
+    age_days = to_float(row.get("age_days"), 999.0)
+    relevance = safe_text(row.get("relevance", ""))
+    direction = safe_text(row.get("direction", row.get("sentiment", "")))
+    if not detected:
+        return "Excluded: no currency detected"
+    if age_days > PUBLIC_NARRATIVE_LOOKBACK_DAYS:
+        return f"Excluded: older than {PUBLIC_NARRATIVE_LOOKBACK_DAYS} days"
+    if relevance == "Weak mention":
+        return "Excluded from firm read: weak currency mention"
+    if direction in ["Neutral", "Mixed"]:
+        return "Included as context: no clear directional score"
+    return "Included in aggregation"
+
+
 def normalize_loaded_narrative_items(frame: pd.DataFrame, dedupe_mode: str = "item") -> pd.DataFrame:
+    extra_columns = ["published_dt", "age_days", "source_item_id", "weighted_source_score"]
     if frame.empty:
-        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "exclusion_reason", "included_in_aggregation"])
+        return pd.DataFrame(columns=NARRATIVE_COLUMNS + extra_columns)
+
     out = frame.copy()
     out.columns = [str(column).strip().lower() for column in out.columns]
     for column in NARRATIVE_COLUMNS:
         if column not in out.columns:
             out[column] = ""
-    out["sentiment"] = out["sentiment"].apply(lambda value: normalize_label(value, {"Bullish", "Bearish", "Neutral", "Mixed"}, "Neutral"))
+    if "snippet_or_summary" in out.columns:
+        out["summary"] = out["summary"].where(out["summary"].astype(str).str.strip().ne(""), out["snippet_or_summary"])
+        out["snippet_or_summary"] = out["snippet_or_summary"].where(out["snippet_or_summary"].astype(str).str.strip().ne(""), out["summary"])
+    out["direction"] = out["direction"].where(out["direction"].astype(str).str.strip().ne(""), out["sentiment"])
+    out["sentiment"] = out["sentiment"].where(out["sentiment"].astype(str).str.strip().ne(""), out["direction"])
+    out["direction"] = out["direction"].apply(lambda value: normalize_label(value, {"Bullish", "Bearish", "Neutral", "Mixed"}, "Neutral"))
+    out["sentiment"] = out["direction"]
     out["confidence"] = out["confidence"].apply(lambda value: normalize_label(value, {"Low", "Medium", "High"}, "Low"))
-    out["relevance"] = out["relevance"].apply(
-        lambda value: normalize_label(
-            value,
-            {"Currency-specific", "Direct macro-policy relevance", "General market commentary", "Weak mention"},
-            "General market commentary",
-        )
-    )
+    out["relevance"] = out["relevance"].apply(normalize_relevance)
+    out["retrieval_source"] = out["retrieval_source"].where(out["retrieval_source"].astype(str).str.strip().ne(""), "CSV")
+    out["content_depth"] = out["content_depth"].where(out["content_depth"].astype(str).str.strip().ne(""), "snippet_only")
     out["published_dt"] = pd.to_datetime(out["published_at"], errors="coerce", utc=True)
     out["age_days"] = out["published_dt"].apply(narrative_age_days)
-    detection_columns = [col for col in ["currency", "detected_currencies", "title", "summary", "themes", "supports", "risks", "reason", "source_name"] if col in out.columns]
+
+    detection_columns = [
+        col
+        for col in [
+            "currency",
+            "detected_currencies",
+            "title",
+            "snippet_or_summary",
+            "summary",
+            "driver_tags",
+            "themes",
+            "supports",
+            "risks",
+            "reason",
+            "source_name",
+        ]
+        if col in out.columns
+    ]
     out["detection_text"] = out[detection_columns].astype(str).agg(" ".join, axis=1) if detection_columns else ""
-    out["detected_currencies"] = out["detection_text"].apply(detected_currency_string)
+    out["detected_currencies"] = out["detected_currencies"].where(
+        out["detected_currencies"].astype(str).str.strip().ne(""),
+        out["detection_text"].apply(detected_currency_string),
+    )
+    out["driver_tags"] = out["driver_tags"].where(
+        out["driver_tags"].astype(str).str.strip().ne(""),
+        out["detection_text"].apply(lambda value: ", ".join(extract_driver_tags(value))),
+    )
     out["dedupe_key"] = (
         out["url"].astype(str).str.strip().str.lower()
         + "|"
@@ -1373,33 +1556,20 @@ def normalize_loaded_narrative_items(frame: pd.DataFrame, dedupe_mode: str = "it
     out = out.drop_duplicates("dedupe_key").drop(columns=["dedupe_key"])
     out["source_item_id"] = range(1, len(out) + 1)
     out["included_in_aggregation"] = out.apply(
-        lambda row: bool(row.get("detected_currencies")) and to_float(row.get("age_days"), 999.0) <= 14 and row.get("relevance") != "Weak mention",
+        lambda row: bool(row.get("detected_currencies"))
+        and to_float(row.get("age_days"), 999.0) <= PUBLIC_NARRATIVE_LOOKBACK_DAYS
+        and row.get("relevance") != "Weak mention",
         axis=1,
     )
     out["exclusion_reason"] = out.apply(narrative_exclusion_reason, axis=1)
     return out.drop(columns=[col for col in ["detection_text"] if col in out.columns])
 
 
-def narrative_exclusion_reason(row: pd.Series) -> str:
-    detected = safe_text(row.get("detected_currencies", ""), "")
-    age_days = to_float(row.get("age_days"), 999.0)
-    relevance = safe_text(row.get("relevance", ""))
-    sentiment = safe_text(row.get("sentiment", ""))
-    if not detected:
-        return "Excluded: no currency detected"
-    if age_days > 14:
-        return "Excluded from firm read: older than 14 days"
-    if relevance == "Weak mention":
-        return "Weak clue only: currency mention is weak"
-    if sentiment in ["Neutral", "Mixed"]:
-        return "Included as context: no clear directional score"
-    return "Included in aggregation"
-
-
 def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
     loaded = normalize_loaded_narrative_items(frame, dedupe_mode="currency")
+    empty_cols = NARRATIVE_COLUMNS + ["published_dt", "age_days", "weighted_source_score", "source_item_id"]
     if loaded.empty:
-        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "weighted_source_score", "exclusion_reason", "included_in_aggregation"])
+        return pd.DataFrame(columns=empty_cols)
 
     exploded_rows = []
     for _, row in loaded.iterrows():
@@ -1412,7 +1582,7 @@ def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
                 clone["currency"] = currency
                 exploded_rows.append(clone)
     if not exploded_rows:
-        return pd.DataFrame(columns=NARRATIVE_COLUMNS + ["detected_currencies", "published_dt", "age_days", "weighted_source_score", "exclusion_reason", "included_in_aggregation"])
+        return pd.DataFrame(columns=empty_cols)
 
     out = pd.DataFrame(exploded_rows)
     out["dedupe_key"] = (
@@ -1426,36 +1596,44 @@ def normalize_narrative_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def narrative_age_days(value: object) -> float:
-    if value is None or pd.isna(value):
-        return 999.0
-    published = pd.to_datetime(value, errors="coerce", utc=True)
-    if pd.isna(published):
-        return 999.0
-    return max((pd.Timestamp.now(tz="UTC") - published).total_seconds() / 86400.0, 0.0)
-
-
 def narrative_freshness_weight(age_days: float) -> float:
     if age_days <= 2:
-        return 1.25
+        return 1.35
     if age_days <= 7:
-        return 1.0
+        return 1.15
     if age_days <= 14:
-        return 0.7
-    return 0.4
+        return 0.85
+    if age_days <= 30:
+        return 0.55
+    return 0.0
+
+
+def narrative_source_type_weight(source_type: object) -> float:
+    text = safe_text(source_type, "").lower()
+    if "central bank" in text or "official" in text:
+        return 1.2
+    if "bank" in text or "asset-manager" in text or "asset manager" in text:
+        return 1.15
+    if "search result" in text or "financial media" in text or "news" in text:
+        return 1.0
+    if "blog" in text:
+        return 0.5
+    return 0.8
 
 
 def narrative_weighted_score(row: pd.Series) -> float:
-    sentiment_weight = {"Bullish": 1.0, "Bearish": -1.0, "Neutral": 0.0, "Mixed": 0.0}.get(safe_text(row.get("sentiment")), 0.0)
-    confidence_weight = {"Low": 0.5, "Medium": 1.0, "High": 1.5}.get(safe_text(row.get("confidence")), 0.5)
+    direction = safe_text(row.get("direction", row.get("sentiment", "")))
+    sentiment_weight = NARRATIVE_SENTIMENT_SCORE.get(direction, 0.0)
+    confidence_weight = {"Low": 0.6, "Medium": 1.0, "High": 1.4}.get(safe_text(row.get("confidence")), 0.6)
     relevance_weight = {
-        "Currency-specific": 1.3,
-        "Direct macro-policy relevance": 1.0,
+        "Direct FX/currency outlook": 1.4,
+        "Direct macro-policy relevance": 1.1,
         "General market commentary": 0.8,
-        "Weak mention": 0.4,
+        "Weak mention": 0.3,
     }.get(safe_text(row.get("relevance")), 0.8)
     freshness_weight = narrative_freshness_weight(to_float(row.get("age_days"), 999.0))
-    return sentiment_weight * confidence_weight * freshness_weight * relevance_weight
+    source_weight = narrative_source_type_weight(row.get("source_type", ""))
+    return sentiment_weight * confidence_weight * freshness_weight * relevance_weight * source_weight
 
 
 def split_theme_tokens(values: pd.Series) -> list[str]:
@@ -1463,7 +1641,7 @@ def split_theme_tokens(values: pd.Series) -> list[str]:
     for value in values.dropna().astype(str):
         for token in re.split(r"[;,|]", value):
             clean = token.strip()
-            if clean:
+            if clean and clean.lower() != "n/a":
                 tokens.append(clean)
     return tokens
 
@@ -1473,8 +1651,8 @@ def top_texts(rows: pd.DataFrame, columns: list[str], limit: int = 2) -> str:
     for _, row in rows.iterrows():
         for column in columns:
             text = safe_text(row.get(column, ""), "")
-            if text and text not in snippets:
-                snippets.append(shorten(text, 110))
+            if text and text.lower() not in ["n/a", "nan", "none"] and text not in snippets:
+                snippets.append(shorten(text, 120))
                 break
         if len(snippets) >= limit:
             break
@@ -1495,6 +1673,7 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "neutral_mixed_sources": 0,
                 "latest_source_date": "n/a",
                 "source_count": 0,
+                "main_drivers": "n/a",
                 "main_themes": "n/a",
                 "supporting_arguments": "n/a",
                 "opposing_arguments": "n/a",
@@ -1512,8 +1691,12 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
     if "age_days" not in details.columns:
         details["age_days"] = details["published_dt"].apply(narrative_age_days)
     details["weighted_source_score"] = details.apply(narrative_weighted_score, axis=1).round(3)
-    if "included_in_aggregation" not in details.columns:
-        details["included_in_aggregation"] = details["age_days"].le(14) & details["detected_currencies"].astype(str).ne("") & details["relevance"].astype(str).ne("Weak mention")
+    details["included_in_aggregation"] = details.apply(
+        lambda row: bool(row.get("detected_currencies"))
+        and to_float(row.get("age_days"), 999.0) <= PUBLIC_NARRATIVE_LOOKBACK_DAYS
+        and row.get("relevance") != "Weak mention",
+        axis=1,
+    )
     details["exclusion_reason"] = details.apply(narrative_exclusion_reason, axis=1)
 
     strength_map = {}
@@ -1523,21 +1706,21 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
     summary_rows = []
     for currency in sorted(FX_CURRENCIES):
         rows = details[details["currency"].eq(currency)].copy()
-        fresh_rows = rows[rows["age_days"].le(14)]
+        fresh_rows = rows[rows["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS)]
         used_rows = rows[to_bool_series(rows["included_in_aggregation"])] if not rows.empty else rows
         working = used_rows if not used_rows.empty else (fresh_rows if not fresh_rows.empty else rows)
         source_count = int(len(rows))
         fresh_count = int(len(fresh_rows))
         used_count = int(len(used_rows))
-        bullish_sources = int(working["sentiment"].eq("Bullish").sum())
-        bearish_sources = int(working["sentiment"].eq("Bearish").sum())
-        neutral_mixed_sources = int(working["sentiment"].isin(["Neutral", "Mixed"]).sum())
+        bullish_sources = int(used_rows["direction"].eq("Bullish").sum()) if not used_rows.empty else 0
+        bearish_sources = int(used_rows["direction"].eq("Bearish").sum()) if not used_rows.empty else 0
+        neutral_mixed_sources = int(working["direction"].isin(["Neutral", "Mixed"]).sum()) if not working.empty else 0
         weighted_score = float(used_rows["weighted_source_score"].sum()) if not used_rows.empty else 0.0
-        bull_weight = float(working.loc[working["weighted_source_score"] > 0, "weighted_source_score"].sum()) if not working.empty else 0.0
-        bear_weight = abs(float(working.loc[working["weighted_source_score"] < 0, "weighted_source_score"].sum())) if not working.empty else 0.0
-        contradiction = bull_weight > 0.75 and bear_weight > 0.75 and min(bull_weight, bear_weight) / max(bull_weight, bear_weight) > 0.35
+        bull_weight = float(used_rows.loc[used_rows["weighted_source_score"] > 0, "weighted_source_score"].sum()) if not used_rows.empty else 0.0
+        bear_weight = abs(float(used_rows.loc[used_rows["weighted_source_score"] < 0, "weighted_source_score"].sum())) if not used_rows.empty else 0.0
+        contradiction = bull_weight >= 1.0 and bear_weight >= 1.0 and min(bull_weight, bear_weight) / max(bull_weight, bear_weight) > 0.35
 
-        if used_count < 2:
+        if used_count < 3:
             sentiment = "Not enough data"
         elif contradiction:
             sentiment = "Mixed"
@@ -1554,7 +1737,7 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
             confidence = "Low"
         elif abs(weighted_score) >= 2.5 and used_count >= 4 and not contradiction:
             confidence = "High"
-        elif abs(weighted_score) >= 1.0 and used_count >= 2:
+        elif abs(weighted_score) >= 1.0 and used_count >= 3:
             confidence = "Medium"
         else:
             confidence = "Low"
@@ -1571,26 +1754,28 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         else:
             narrative_vs_dashboard = "Not enough data"
 
-        themes = split_theme_tokens(working["themes"]) if not working.empty else []
+        drivers = split_theme_tokens(working["driver_tags"]) if "driver_tags" in working.columns and not working.empty else []
+        themes = split_theme_tokens(working["themes"]) if "themes" in working.columns and not working.empty else []
+        top_drivers = pd.Series(drivers).value_counts().head(5).index.tolist() if drivers else []
         top_themes = pd.Series(themes).value_counts().head(4).index.tolist() if themes else []
         latest_date = "n/a"
         if not rows.empty and rows["published_dt"].notna().any():
             latest_date = str(rows["published_dt"].max().date())
         weak_clues = top_texts(rows.sort_values("age_days"), ["title", "summary", "reason"], limit=3) if not rows.empty else "n/a"
         loaded_titles = top_texts(rows.sort_values("age_days"), ["title"], limit=4) if not rows.empty else "n/a"
-        if used_count < 2:
+        if used_count < 3:
             if rows.empty:
                 why_no_firm_read = "No loaded source detected this currency."
-            elif fresh_count < 2:
-                why_no_firm_read = f"Only {fresh_count} fresh detected item(s); at least 2 good fresh sources are required."
+            elif fresh_count < 3:
+                why_no_firm_read = f"Only {fresh_count} item(s) inside the 30-day window; at least 3 usable items are required."
             else:
-                why_no_firm_read = f"Only {used_count} good item(s) after weak-mention and freshness filters; at least 2 are required."
+                why_no_firm_read = f"Only {used_count} usable item(s) after relevance/freshness filters; at least 3 are required."
         elif contradiction:
             why_no_firm_read = "Bullish and bearish public evidence both matter, so the read stays mixed."
         elif sentiment in ["Neutral", "Mixed"]:
             why_no_firm_read = "Loaded sources do not produce a clear directional public narrative."
         else:
-            why_no_firm_read = "A directional narrative exists, but it remains research context only."
+            why_no_firm_read = "A directional public narrative exists, but it remains research context only."
 
         summary_rows.append(
             {
@@ -1605,9 +1790,10 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "source_count": source_count,
                 "fresh_source_count": fresh_count,
                 "used_source_count": used_count,
+                "main_drivers": ", ".join(top_drivers) if top_drivers else "n/a",
                 "main_themes": ", ".join(top_themes) if top_themes else "n/a",
-                "supporting_arguments": top_texts(working[working["weighted_source_score"] > 0].sort_values("weighted_source_score", ascending=False), ["supports", "summary", "reason"]),
-                "opposing_arguments": top_texts(working[working["weighted_source_score"] < 0].sort_values("weighted_source_score"), ["risks", "summary", "reason"]),
+                "supporting_arguments": top_texts(used_rows[used_rows["weighted_source_score"] > 0].sort_values("weighted_source_score", ascending=False), ["supports", "summary", "reason"]),
+                "opposing_arguments": top_texts(used_rows[used_rows["weighted_source_score"] < 0].sort_values("weighted_source_score"), ["risks", "summary", "reason"]),
                 "weak_clues": weak_clues,
                 "loaded_source_titles": loaded_titles,
                 "why_no_firm_read": why_no_firm_read,
@@ -1630,104 +1816,145 @@ def narrative_tone(sentiment: str) -> str:
     return "info"
 
 
+def extract_driver_tags(value: object) -> list[str]:
+    text = safe_text(value, "")
+    tags = []
+    for tag, terms in NARRATIVE_DRIVER_TERMS.items():
+        if text_has_any(text, terms):
+            tags.append(tag)
+    return tags or ["public commentary"]
+
+
 def classify_relevance(source_type: str, text: str, detected_from_text: bool) -> str:
+    lowered = safe_text(text, "").lower()
     if not detected_from_text:
         return "Weak mention"
-    if any(term in text for term in ["currency", "fx", "foreign exchange", "dollar", "yen", "sterling", "euro", "aussie", "kiwi", "loonie"]):
-        return "Currency-specific"
-    if any(term in text for term in ["central bank", "rates", "rate", "yield", "inflation", "cpi", "fomc", "ecb", "boe", "boj", "boc", "rba", "rbnz", "snb"]):
+    if any(term in lowered for term in ["fx", "forex", "currency", "foreign exchange", "dollar", "yen", "sterling", "euro", "aussie", "kiwi", "loonie"]):
+        return "Direct FX/currency outlook"
+    if any(term in lowered for term in ["central bank", "rates", "rate", "yield", "inflation", "cpi", "fomc", "ecb", "boe", "boj", "boc", "rba", "rbnz", "snb"]):
         return "Direct macro-policy relevance"
-    if "Central bank" in source_type or "Official" in source_type:
+    if "central bank" in source_type.lower() or "official" in source_type.lower():
         return "Direct macro-policy relevance"
     return "General market commentary"
 
 
-def classify_currency_sentiment(currency: str, text: str) -> tuple[str, str, str, str, str, str]:
+def classify_horizon(text: str) -> str:
+    lowered = safe_text(text, "").lower()
+    if any(term in lowered for term in ["intraday", "today", "overnight"]):
+        return "Intraday"
+    if any(term in lowered for term in ["short-term", "near-term", "this week", "coming days"]):
+        return "Short-term"
+    if any(term in lowered for term in ["medium-term", "next quarter", "coming months", "2026", "2027"]):
+        return "Medium-term"
+    return "Unclear"
+
+
+def classify_currency_sentiment(currency: str, text: str) -> tuple[str, str, str, str, str, str, str]:
     support: list[str] = []
     risk: list[str] = []
-    themes: list[str] = []
+    themes = extract_driver_tags(text)
 
-    hawkish = text_has_any(text, ["hawkish", "higher yields", "higher rates", "rising yields", "yields rise", "yields rose", "tightening", "rate hike", "restrictive policy"])
+    alias_terms = CURRENCY_DETECTION_TERMS.get(currency, [currency])
+    mentions_currency = text_has_any(text, alias_terms)
+    explicit_bullish = mentions_currency and text_has_any(
+        text,
+        ["bullish", "strength", "stronger", "rally", "rallies", "gains", "upside", "outperform", "appreciation"],
+    )
+    explicit_bearish = mentions_currency and text_has_any(
+        text,
+        ["bearish", "weakness", "weaker", "selloff", "sell-off", "falls", "downside", "underperform", "depreciation"],
+    )
+    hawkish = text_has_any(text, ["hawkish", "higher yields", "higher rates", "rising yields", "yields rise", "yields rose", "delayed cuts", "rate hike", "tightening", "restrictive policy"])
     dovish = text_has_any(text, ["dovish", "rate cuts", "rate cut", "cut rates", "lower yields", "lower rates", "easing", "policy easing"])
     hot_inflation = text_has_any(text, ["hot inflation", "sticky inflation", "inflation pressure", "higher inflation", "above-target inflation", "price pressures"])
-    weak_growth = text_has_any(text, ["weak growth", "growth weakness", "slowdown", "recession", "contraction", "stagnation", "downturn"])
+    weak_growth = text_has_any(text, ["weak growth", "growth weakness", "slowdown", "recession", "contraction", "stagnation", "downturn", "weak data"])
+    strong_growth = text_has_any(text, ["strong growth", "growth upside", "resilient growth", "upside surprise", "strong data"])
     risk_off = text_has_any(text, ["risk-off", "risk off", "risk aversion", "safe haven", "market stress", "volatility spike", "liquidity stress"])
     risk_on = text_has_any(text, ["risk-on", "risk on", "risk appetite", "soft landing", "equities rally", "carry demand"])
-    commodity_strength = text_has_any(text, ["commodity strength", "commodities higher", "higher commodities", "higher oil", "oil strength", "higher metals", "metals rally"])
+    commodity_strength = text_has_any(text, ["commodity strength", "commodities higher", "higher commodities", "higher metals", "metals rally", "iron ore rises"])
+    oil_strength = text_has_any(text, ["higher oil", "oil strength", "oil prices rise", "oil prices rose", "crude rally"])
     oil_weakness = text_has_any(text, ["oil weakness", "lower oil", "oil prices fall", "oil prices fell", "weaker oil", "oil selloff"])
+    china_weakness = text_has_any(text, ["China weakness", "Chinese slowdown", "weak China", "China demand weak", "China slowdown"])
 
+    if explicit_bullish:
+        support.append("source language explicitly leans bullish/stronger for this currency")
+    if explicit_bearish:
+        risk.append("source language explicitly leans bearish/weaker for this currency")
     if hawkish:
-        support.append("hawkish central bank / higher yields can support the currency")
-        themes.append("rates")
+        support.append("hawkish central bank or higher yields can support the currency")
     if dovish:
-        risk.append("dovish central bank / rate-cut pressure can weigh on the currency")
-        themes.append("rates")
+        risk.append("dovish policy or rate-cut pressure can weigh on the currency")
     if hot_inflation:
         if weak_growth:
-            support.append("hot inflation can support rates")
-            risk.append("weak growth makes the inflation signal mixed")
+            support.append("sticky inflation can support rates")
+            risk.append("weak growth makes the inflation impulse mixed")
         else:
-            support.append("hot inflation can support the currency through rates expectations")
-        themes.append("inflation")
+            support.append("sticky inflation can support the currency through rates expectations")
+    if strong_growth:
+        support.append("stronger growth or upside data surprises can support the currency")
     if weak_growth:
-        risk.append("weak growth / recession language can pressure the currency")
-        themes.append("growth")
+        risk.append("weak growth or recession language can pressure the currency")
     if risk_off:
-        themes.append("risk-off")
         if currency in ["JPY", "CHF"]:
             support.append("risk-off language can support safe-haven currencies")
         elif currency in ["AUD", "NZD", "CAD"]:
-            risk.append("risk-off language can pressure high-beta / commodity-linked currencies")
+            risk.append("risk-off language can pressure high-beta or commodity-linked currencies")
         elif currency == "USD":
             support.append("risk-off language can support USD liquidity demand")
-            risk.append("risk-off can also conflict with growth-sensitive USD narratives")
+            risk.append("risk-off can conflict with growth-sensitive USD narratives")
     if risk_on:
-        themes.append("risk-on")
         if currency in ["AUD", "NZD", "CAD"]:
-            support.append("risk-on language can support high-beta / commodity-linked currencies")
+            support.append("risk-on language can support high-beta or commodity-linked currencies")
         elif currency in ["JPY", "CHF"]:
             risk.append("risk-on language can reduce safe-haven demand")
-    if commodity_strength:
-        themes.append("commodities")
-        if currency in ["CAD", "AUD"]:
-            support.append("commodity strength can support CAD/AUD")
+    if commodity_strength and currency in ["CAD", "AUD"]:
+        support.append("commodity strength can support CAD/AUD")
+    if oil_strength and currency == "CAD":
+        support.append("oil strength can support CAD")
     if oil_weakness and currency == "CAD":
-        themes.append("oil")
         risk.append("oil weakness can pressure CAD")
+    if china_weakness and currency in ["AUD", "NZD"]:
+        risk.append("China weakness can pressure AUD/NZD")
 
     support = list(dict.fromkeys(support))
     risk = list(dict.fromkeys(risk))
-    themes = list(dict.fromkeys(themes)) or ["public commentary"]
-
     if support and risk:
-        sentiment = "Mixed"
+        direction = "Mixed"
     elif support:
-        sentiment = "Bullish"
+        direction = "Bullish"
     elif risk:
-        sentiment = "Bearish"
+        direction = "Bearish"
     else:
-        sentiment = "Neutral"
+        direction = "Neutral"
 
     evidence_count = len(support) + len(risk)
-    if sentiment in ["Bullish", "Bearish"] and evidence_count >= 2:
-        confidence = "Medium"
-    elif sentiment == "Mixed" and evidence_count >= 2:
+    if direction in ["Bullish", "Bearish"] and evidence_count >= 2:
+        confidence = "High"
+    elif direction != "Neutral" and evidence_count >= 1:
         confidence = "Medium"
     else:
         confidence = "Low"
+    if evidence_count >= 2:
+        evidence_strength = "Strong"
+    elif evidence_count == 1:
+        evidence_strength = "Medium"
+    else:
+        evidence_strength = "Weak"
 
     reason = "No strong directional FX rule matched; kept as public context."
-    if sentiment != "Neutral":
+    if direction != "Neutral":
         reason = " | ".join((support + risk)[:3])
-    return sentiment, confidence, "; ".join(themes), " | ".join(support), " | ".join(risk), reason
+    return direction, confidence, ", ".join(themes), " | ".join(support), " | ".join(risk), reason, evidence_strength
 
 
 def classify_public_item(source: dict, title: str, summary: str, published_at: str, url: str) -> list[dict]:
     source_name = safe_text(source.get("source_name", "Unknown source"))
     source_type = safe_text(source.get("source_type", "Public commentary"))
     coverage = safe_text(source.get("coverage", "")).upper()
-    content_text = f"{title} {summary}".lower()
-    source_context = f"{source_name} {coverage}".lower()
+    retrieval_source = safe_text(source.get("retrieval_source", "RSS"))
+    content_depth = safe_text(source.get("content_depth", "snippet_only"))
+    content_text = f"{title} {summary}"
+    source_context = f"{source_name} {coverage}"
     text = f"{content_text} {source_context}"
     detected = extract_currencies(text)
     detected_from_text = bool(extract_currencies(content_text))
@@ -1739,11 +1966,13 @@ def classify_public_item(source: dict, title: str, summary: str, published_at: s
     relevance = classify_relevance(source_type, text, detected_from_text or coverage in FX_CURRENCIES)
     if coverage in FX_CURRENCIES and any(label in source_type.lower() for label in ["central bank", "official"]):
         relevance = "Direct macro-policy relevance"
+    horizon = classify_horizon(text)
     rows = []
     for currency in detected:
-        sentiment, confidence, themes, supports, risks, reason = classify_currency_sentiment(currency, text)
-        if relevance == "Weak mention" and confidence == "Medium":
+        direction, confidence, themes, supports, risks, reason, evidence_strength = classify_currency_sentiment(currency, text)
+        if relevance == "Weak mention":
             confidence = "Low"
+            evidence_strength = "Weak"
         rows.append(
             {
                 "currency": currency,
@@ -1753,14 +1982,21 @@ def classify_public_item(source: dict, title: str, summary: str, published_at: s
                 "title": title,
                 "url": url,
                 "published_at": published_at,
-                "summary": shorten(summary, 260),
-                "sentiment": sentiment,
+                "snippet_or_summary": shorten(summary, 320),
+                "summary": shorten(summary, 320),
+                "driver_tags": themes,
+                "direction": direction,
+                "sentiment": direction,
                 "confidence": confidence,
                 "relevance": relevance,
+                "horizon": horizon,
+                "evidence_strength": evidence_strength,
                 "themes": themes,
                 "supports": supports,
                 "risks": risks,
                 "reason": reason,
+                "retrieval_source": retrieval_source,
+                "content_depth": content_depth,
             }
         )
     return rows
@@ -1777,11 +2013,45 @@ def parse_feed_date(value: object) -> str:
     text = safe_text(value, "")
     if not text:
         return ""
+    if re.fullmatch(r"\d{14}", text):
+        parsed = pd.to_datetime(text, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        return "" if pd.isna(parsed) else parsed.isoformat()
+    if re.fullmatch(r"\d{8}", text):
+        parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce", utc=True)
+        return "" if pd.isna(parsed) else parsed.isoformat()
     try:
         return parsedate_to_datetime(text).isoformat()
     except Exception:
         parsed = pd.to_datetime(text, errors="coerce", utc=True)
         return "" if pd.isna(parsed) else parsed.isoformat()
+
+
+def extract_google_item_date(item: dict) -> str:
+    pagemap = item.get("pagemap", {}) if isinstance(item, dict) else {}
+    metatags = pagemap.get("metatags", []) if isinstance(pagemap, dict) else []
+    date_keys = [
+        "article:published_time",
+        "datepublished",
+        "date",
+        "dc.date",
+        "pubdate",
+        "og:updated_time",
+    ]
+    for meta in metatags:
+        lowered = {str(k).lower(): v for k, v in meta.items()}
+        for key in date_keys:
+            if lowered.get(key):
+                parsed = pd.to_datetime(lowered[key], errors="coerce", utc=True)
+                if not pd.isna(parsed):
+                    return parsed.isoformat()
+    return pd.Timestamp.now(tz="UTC").isoformat()
+
+
+def fetch_json(url: str, timeout: int = 10) -> dict:
+    request = urllib.request.Request(url, headers={"User-Agent": "MacroFXCockpitPublicNarrativeMonitor/1.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = response.read().decode("utf-8", errors="replace")
+    return json.loads(payload)
 
 
 def fetch_feed_items(source: dict, per_source_limit: int = 6) -> tuple[list[dict], list[dict]]:
@@ -1821,77 +2091,271 @@ def fetch_feed_items(source: dict, per_source_limit: int = 6) -> tuple[list[dict
         source_context = f"{safe_text(source.get('source_name', ''))} {safe_text(source.get('coverage', ''))}"
         detection_text = f"{title} {summary} {source_context}"
         detected = detected_currency_string(detection_text)
-        source_type = safe_text(source.get("source_type", "Public commentary"))
-        coverage = safe_text(source.get("coverage", "")).upper()
-        relevance = classify_relevance(source_type, detection_text.lower(), bool(extract_currencies(f"{title} {summary}")) or coverage in FX_CURRENCIES)
-        if coverage in FX_CURRENCIES and any(label in source_type.lower() for label in ["central bank", "official"]):
-            relevance = "Direct macro-policy relevance"
         raw_rows.append(
             {
                 "currency": detected,
                 "detected_currencies": detected,
                 "source_name": source.get("source_name", "Unknown source"),
-                "source_type": source_type,
+                "source_type": source.get("source_type", "Public commentary"),
                 "title": title,
                 "url": url,
                 "published_at": published_at,
+                "snippet_or_summary": shorten(summary, 320),
                 "summary": shorten(summary, 320),
+                "driver_tags": ", ".join(extract_driver_tags(detection_text)),
+                "direction": "Neutral",
                 "sentiment": "Neutral",
                 "confidence": "Low",
-                "relevance": relevance,
+                "relevance": classify_relevance(safe_text(source.get("source_type", "")), detection_text, bool(extract_currencies(f"{title} {summary}"))),
+                "horizon": classify_horizon(detection_text),
+                "evidence_strength": "Weak",
                 "themes": "public commentary",
                 "supports": "",
                 "risks": "",
                 "reason": "Raw fetched public item. Classification happens per detected currency.",
+                "retrieval_source": "RSS",
+                "content_depth": "snippet_only",
             }
         )
-        classified_rows.extend(classify_public_item(source, title, summary, published_at, url))
+        classified_rows.extend(classify_public_item({**source, "retrieval_source": "RSS", "content_depth": "snippet_only"}, title, summary, published_at, url))
     return raw_rows, classified_rows
 
 
-@st.cache_data(ttl=14400, show_spinner=False)
-def fetch_public_narratives(refresh_token: int) -> tuple[pd.DataFrame, list[dict], str, dict, pd.DataFrame]:
-    rows = []
-    raw_rows = []
-    failures = []
+def fetch_google_cse_items(api_key: str, engine_id: str) -> tuple[list[dict], list[dict], list[dict], list[dict], str]:
+    raw_rows: list[dict] = []
+    classified_rows: list[dict] = []
+    failures: list[dict] = []
+    query_rows: list[dict] = []
+    total_results = 0
+    status = "available"
+    for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
+        for query in queries[:3]:
+            if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH:
+                break
+            params = {
+                "key": api_key,
+                "cx": engine_id,
+                "q": query,
+                "num": GOOGLE_CSE_RESULTS_PER_QUERY,
+                "dateRestrict": "m1",
+            }
+            url = "https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode(params)
+            query_status = "attempted"
+            try:
+                payload = fetch_json(url, timeout=10)
+                items = payload.get("items", []) if isinstance(payload, dict) else []
+                query_status = f"{len(items)} result(s)"
+                for item in items[:GOOGLE_CSE_RESULTS_PER_QUERY]:
+                    result_url = safe_text(item.get("link", ""))
+                    title = clean_feed_text(item.get("title", ""))
+                    summary = clean_feed_text(item.get("snippet", ""))
+                    published_at = extract_google_item_date(item)
+                    source_name = safe_text(item.get("displayLink", "")) or source_domain(result_url)
+                    source = {
+                        "source_name": source_name,
+                        "source_type": "Established financial media/search result",
+                        "coverage": currency,
+                        "retrieval_source": "Google CSE",
+                        "content_depth": "public_page_snippet",
+                    }
+                    detection_text = f"{title} {summary} {currency}"
+                    raw_rows.append(
+                        {
+                            "currency": currency,
+                            "detected_currencies": detected_currency_string(detection_text, currency),
+                            "source_name": source_name,
+                            "source_type": source["source_type"],
+                            "title": title,
+                            "url": result_url,
+                            "published_at": published_at,
+                            "snippet_or_summary": shorten(summary, 320),
+                            "summary": shorten(summary, 320),
+                            "driver_tags": ", ".join(extract_driver_tags(detection_text)),
+                            "direction": "Neutral",
+                            "sentiment": "Neutral",
+                            "confidence": "Low",
+                            "relevance": classify_relevance(source["source_type"], detection_text, True),
+                            "horizon": classify_horizon(detection_text),
+                            "evidence_strength": "Weak",
+                            "themes": "public commentary",
+                            "supports": "",
+                            "risks": "",
+                            "reason": "Google CSE search result snippet; no article full text fetched.",
+                            "retrieval_source": "Google CSE",
+                            "content_depth": "public_page_snippet",
+                        }
+                    )
+                    classified_rows.extend(classify_public_item(source, title, summary, published_at, result_url))
+                total_results += len(items)
+            except urllib.error.HTTPError as exc:
+                error_text = shorten(str(exc), 180)
+                status = "quota error / failed" if exc.code in [403, 429] else "failed"
+                query_status = status
+                failures.append({"source_name": "Google Custom Search JSON API", "source_type": "Curated search", "url": "https://www.googleapis.com/customsearch/v1", "error": error_text})
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                status = "failed"
+                query_status = "failed"
+                failures.append({"source_name": "Google Custom Search JSON API", "source_type": "Curated search", "url": "https://www.googleapis.com/customsearch/v1", "error": shorten(str(exc), 180)})
+            query_rows.append({"retrieval_source": "Google CSE", "currency": currency, "query": query, "status": query_status})
+        if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH:
+            break
+    return raw_rows, classified_rows, failures, query_rows, status
+
+
+def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    raw_rows: list[dict] = []
+    classified_rows: list[dict] = []
+    failures: list[dict] = []
+    query_rows: list[dict] = []
+    end_dt = pd.Timestamp.now(tz="UTC")
+    start_dt = end_dt - pd.Timedelta(days=PUBLIC_NARRATIVE_LOOKBACK_DAYS)
+    for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
+        for query in queries[:2]:
+            gdelt_query = f'({query}) forex currency outlook'
+            params = {
+                "query": gdelt_query,
+                "mode": "ArtList",
+                "format": "json",
+                "maxrecords": 8,
+                "sort": "DateDesc",
+                "startdatetime": start_dt.strftime("%Y%m%d%H%M%S"),
+                "enddatetime": end_dt.strftime("%Y%m%d%H%M%S"),
+            }
+            url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
+            query_status = "attempted"
+            try:
+                payload = fetch_json(url, timeout=10)
+                articles = payload.get("articles", []) if isinstance(payload, dict) else []
+                query_status = f"{len(articles)} result(s)"
+                for article in articles:
+                    result_url = safe_text(article.get("url", ""))
+                    title = clean_feed_text(article.get("title", ""))
+                    summary = clean_feed_text(article.get("snippet", "") or article.get("seendate", ""))
+                    published_text = parse_feed_date(article.get("seendate", ""))
+                    source_name = safe_text(article.get("domain", "")) or source_domain(result_url)
+                    source = {
+                        "source_name": source_name,
+                        "source_type": "Established financial media/search result",
+                        "coverage": currency,
+                        "retrieval_source": "GDELT",
+                        "content_depth": "metadata_only",
+                    }
+                    detection_text = f"{title} {summary} {currency}"
+                    raw_rows.append(
+                        {
+                            "currency": currency,
+                            "detected_currencies": detected_currency_string(detection_text, currency),
+                            "source_name": source_name,
+                            "source_type": source["source_type"],
+                            "title": title,
+                            "url": result_url,
+                            "published_at": published_text,
+                            "snippet_or_summary": shorten(summary, 320),
+                            "summary": shorten(summary, 320),
+                            "driver_tags": ", ".join(extract_driver_tags(detection_text)),
+                            "direction": "Neutral",
+                            "sentiment": "Neutral",
+                            "confidence": "Low",
+                            "relevance": classify_relevance(source["source_type"], detection_text, True),
+                            "horizon": classify_horizon(detection_text),
+                            "evidence_strength": "Weak",
+                            "themes": "public commentary",
+                            "supports": "",
+                            "risks": "",
+                            "reason": "GDELT metadata result; no article full text fetched.",
+                            "retrieval_source": "GDELT",
+                            "content_depth": "metadata_only",
+                        }
+                    )
+                    classified_rows.extend(classify_public_item(source, title, summary, published_text, result_url))
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                query_status = "failed"
+                failures.append({"source_name": "GDELT DOC API", "source_type": "News metadata API", "url": "https://api.gdeltproject.org/api/v2/doc/doc", "error": shorten(str(exc), 180)})
+            query_rows.append({"retrieval_source": "GDELT", "currency": currency, "query": query, "status": query_status})
+    return raw_rows, classified_rows, failures, query_rows
+
+
+@st.cache_data(ttl=PUBLIC_NARRATIVE_CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: bool, use_rss: bool) -> tuple[pd.DataFrame, list[dict], str, dict, pd.DataFrame]:
+    rows: list[dict] = []
+    raw_rows: list[dict] = []
+    failures: list[dict] = []
+    query_rows: list[dict] = []
     attempted = 0
     successful = 0
-    for source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
-        if not source.get("fetch_enabled"):
-            continue
+    retrieval_modes: list[str] = []
+    google_status = "disabled"
+
+    if use_rss:
+        retrieval_modes.append("RSS")
+        for source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
+            if not source.get("fetch_enabled"):
+                continue
+            attempted += 1
+            try:
+                source_raw, source_rows = fetch_feed_items(source, per_source_limit=6)
+                raw_rows.extend(source_raw)
+                rows.extend(source_rows)
+                successful += 1
+            except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError, TimeoutError, OSError) as exc:
+                failures.append(
+                    {
+                        "source_name": source.get("source_name", "Unknown source"),
+                        "source_type": source.get("source_type", ""),
+                        "url": source.get("feed_url") or source.get("url"),
+                        "error": shorten(str(exc), 180),
+                    }
+                )
+
+    if use_gdelt:
+        retrieval_modes.append("GDELT")
         attempted += 1
-        try:
-            source_raw, source_rows = fetch_feed_items(source, per_source_limit=6)
-            raw_rows.extend(source_raw)
-            rows.extend(source_rows)
-            successful += 1
-        except (urllib.error.URLError, urllib.error.HTTPError, ET.ParseError, TimeoutError, OSError) as exc:
-            failures.append(
-                {
-                    "source_name": source.get("source_name", "Unknown source"),
-                    "source_type": source.get("source_type", ""),
-                    "url": source.get("feed_url") or source.get("url"),
-                    "error": shorten(str(exc), 180),
-                }
-            )
-        if len(rows) >= 120:
-            rows = rows[:120]
-            break
+        gdelt_raw, gdelt_rows, gdelt_failures, gdelt_queries = fetch_gdelt_items()
+        raw_rows.extend(gdelt_raw)
+        rows.extend(gdelt_rows)
+        failures.extend(gdelt_failures)
+        query_rows.extend(gdelt_queries)
+        successful += 1 if gdelt_raw or gdelt_rows else 0
+
+    api_key = read_secret_or_env("GOOGLE_SEARCH_API_KEY")
+    engine_id = read_secret_or_env("GOOGLE_SEARCH_ENGINE_ID")
+    if use_google:
+        retrieval_modes.append("Curated Google CSE")
+        if not api_key or not engine_id:
+            google_status = "missing credentials"
+        else:
+            attempted += 1
+            google_raw, google_rows, google_failures, google_queries, google_status = fetch_google_cse_items(api_key, engine_id)
+            raw_rows.extend(google_raw)
+            rows.extend(google_rows)
+            failures.extend(google_failures)
+            query_rows.extend(google_queries)
+            successful += 1 if google_raw or google_rows else 0
+
     refreshed_at = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M UTC")
     raw_frame = pd.DataFrame(raw_rows)
     classified_frame = pd.DataFrame(rows)
     normalized_raw = normalize_loaded_narrative_items(raw_frame)
     normalized_details = normalize_narrative_frame(classified_frame)
+    normalized_raw_count = len(normalized_raw)
+    details_used = int(to_bool_series(normalized_details["included_in_aggregation"]).sum()) if not normalized_details.empty and "included_in_aggregation" in normalized_details.columns else 0
     diagnostics = {
+        "retrieval_mode": " + ".join(retrieval_modes) if retrieval_modes else "CSV/cache only",
+        "google_cse_status": google_status,
+        "last_refresh": refreshed_at,
         "sources_configured": len(PUBLIC_NARRATIVE_SOURCE_REGISTRY),
         "sources_attempted": attempted,
         "sources_successful": successful,
         "sources_failed": len(failures),
         "items_fetched": len(raw_rows),
-        "items_after_dedupe": len(normalized_raw),
-        "items_after_freshness_filter": int(normalized_raw["age_days"].le(14).sum()) if not normalized_raw.empty and "age_days" in normalized_raw.columns else 0,
+        "items_after_dedupe": normalized_raw_count,
+        "items_within_30_days": int(normalized_raw["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not normalized_raw.empty and "age_days" in normalized_raw.columns else 0,
+        "items_after_freshness_filter": int(normalized_raw["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not normalized_raw.empty and "age_days" in normalized_raw.columns else 0,
         "items_with_detected_currencies": int(normalized_raw["detected_currencies"].astype(str).str.len().gt(0).sum()) if not normalized_raw.empty and "detected_currencies" in normalized_raw.columns else 0,
-        "items_used_in_aggregation": int(to_bool_series(normalized_details["included_in_aggregation"]).sum()) if not normalized_details.empty and "included_in_aggregation" in normalized_details.columns else 0,
+        "items_used_in_aggregation": details_used,
+        "items_excluded": max(len(normalized_details) - details_used, 0),
+        "queries_used": query_rows,
+        "configured_curated_domains": "Managed in Google Programmable Search Engine; RSS registry shown below.",
     }
     return classified_frame, failures, refreshed_at, diagnostics, normalized_raw
 
@@ -2425,7 +2889,9 @@ def render_narrative_cards(summary: pd.DataFrame) -> None:
                 f'<div class="line">Sources: {esc(row.get("source_count", 0))} | Latest: {esc(row.get("latest_source_date", "n/a"))}</div>'
                 f'<div class="line">Used / fresh: {esc(row.get("used_source_count", 0))} / {esc(row.get("fresh_source_count", 0))}</div>'
                 f'<div class="line">Bullish / Bearish / Neutral-Mixed: {esc(row.get("bullish_sources", 0))} / {esc(row.get("bearish_sources", 0))} / {esc(row.get("neutral_mixed_sources", 0))}</div>'
+                f'<div class="label">Main drivers</div><div class="mini">{esc(shorten(row.get("main_drivers", "n/a"), 130))}</div>'
                 f'<div class="label">Main themes</div><div class="mini">{esc(shorten(row.get("main_themes", "n/a"), 130))}</div>'
+                f'<div class="label">Support / opposition</div><div class="mini">{esc(shorten(row.get("supporting_arguments", "n/a"), 120))} / {esc(shorten(row.get("opposing_arguments", "n/a"), 120))}</div>'
                 f'<div class="label">Weak clues</div><div class="mini">{esc(shorten(row.get("weak_clues", "n/a"), 150))}</div>'
                 f'<div class="label">Why no firm read?</div><div class="mini">{esc(shorten(row.get("why_no_firm_read", "n/a"), 150))}</div>'
                 f'<div class="label">Narrative vs Dashboard</div><div class="mini">{esc(dashboard_read)}</div>'
@@ -2438,17 +2904,31 @@ def render_narrative_cards(summary: pd.DataFrame) -> None:
 def render_fetch_diagnostics(diagnostics: dict, failures: list[dict]) -> None:
     st.markdown("#### Fetch diagnostics")
     diagnostic_cards = [
+        status_card("Retrieval mode", diagnostics.get("retrieval_mode", "CSV/cache only"), "Narrative retrieval layer used on last refresh.", "info"),
+        status_card("Google CSE status", diagnostics.get("google_cse_status", "missing credentials"), "Uses Streamlit Secrets/env only; never hardcoded.", "good" if diagnostics.get("google_cse_status") == "available" else "watch"),
+        status_card("Last refresh", diagnostics.get("last_refresh", "n/a"), "Refresh happens only when clicked.", "info"),
         status_card("Sources configured", diagnostics.get("sources_configured", len(PUBLIC_NARRATIVE_SOURCE_REGISTRY)), "Curated public source registry.", "info"),
         status_card("Sources attempted", diagnostics.get("sources_attempted", 0), "Only fetch-enabled sources are attempted.", "info"),
         status_card("Sources successful", diagnostics.get("sources_successful", 0), "Returned a readable feed/API response.", "good" if diagnostics.get("sources_successful", 0) else "watch"),
         status_card("Sources failed", diagnostics.get("sources_failed", len(failures)), "Errors are shown below.", "bad" if failures else "good"),
         status_card("Items fetched", diagnostics.get("items_fetched", 0), "Raw public-source items before classification.", "info"),
         status_card("Items after dedupe", diagnostics.get("items_after_dedupe", 0), "Unique by URL/title.", "info"),
-        status_card("Fresh items", diagnostics.get("items_after_freshness_filter", 0), "Within the 14-day narrative window.", "good" if diagnostics.get("items_after_freshness_filter", 0) else "watch"),
+        status_card("Within 30 days", diagnostics.get("items_within_30_days", diagnostics.get("items_after_freshness_filter", 0)), "Items inside the public narrative window.", "good" if diagnostics.get("items_within_30_days", diagnostics.get("items_after_freshness_filter", 0)) else "watch"),
         status_card("Detected currencies", diagnostics.get("items_with_detected_currencies", 0), "Items with at least one FX currency clue.", "good" if diagnostics.get("items_with_detected_currencies", 0) else "watch"),
         status_card("Used in aggregation", diagnostics.get("items_used_in_aggregation", 0), "Fresh, detected and not weak mention.", "good" if diagnostics.get("items_used_in_aggregation", 0) else "watch"),
+        status_card("Excluded", diagnostics.get("items_excluded", 0), "Items shown in details but not used for firm aggregation.", "watch" if diagnostics.get("items_excluded", 0) else "good"),
     ]
     render_status_grid(diagnostic_cards)
+    queries = diagnostics.get("queries_used", [])
+    if queries:
+        with st.expander("Queries used", expanded=False):
+            render_dataframe(pd.DataFrame(queries), height=320)
+    with st.expander("Configured curated source domains", expanded=False):
+        st.caption(safe_text(diagnostics.get("configured_curated_domains", "Google CSE domains are managed inside your Programmable Search Engine.")))
+        registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
+        if not registry.empty:
+            show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
+            render_dataframe(registry[show_cols], height=300)
     if failures:
         with st.expander("Failed source errors", expanded=False):
             render_dataframe(pd.DataFrame(failures), height=260)
@@ -2464,10 +2944,17 @@ def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFra
                 "source_type",
                 "title",
                 "published_at",
+                "retrieval_source",
+                "content_depth",
                 "detected_currencies",
+                "driver_tags",
+                "direction",
                 "sentiment",
                 "confidence",
                 "relevance",
+                "horizon",
+                "evidence_strength",
+                "included_in_aggregation",
                 "exclusion_reason",
                 "url",
             ]
@@ -2493,9 +2980,10 @@ def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFra
                 st.markdown(
                     (
                         f"{link}\n\n"
-                        f"Source: `{esc(row.get('source_name', 'n/a'))}` | Type: `{esc(row.get('source_type', 'n/a'))}` | Date: `{esc(date_text)}`  \n"
-                        f"Detected currencies: `{esc(row.get('detected_currencies', row.get('currency')))} ` | Item currency: `{esc(row.get('currency'))}` | Sentiment: `{esc(row.get('sentiment'))}` | "
-                        f"Confidence: `{esc(row.get('confidence'))}` | Relevance: `{esc(row.get('relevance'))}`  \n"
+                        f"Source: `{esc(row.get('source_name', 'n/a'))}` | Type: `{esc(row.get('source_type', 'n/a'))}` | Retrieval: `{esc(row.get('retrieval_source', 'n/a'))}` | Date: `{esc(date_text)}`  \n"
+                        f"Detected currencies: `{esc(row.get('detected_currencies', row.get('currency')))} ` | Item currency: `{esc(row.get('currency'))}` | Direction: `{esc(row.get('direction', row.get('sentiment')))} ` | "
+                        f"Confidence: `{esc(row.get('confidence'))}` | Relevance: `{esc(row.get('relevance'))}` | Drivers: `{esc(row.get('driver_tags', 'n/a'))}`  \n"
+                        f"Included: `{esc(row.get('included_in_aggregation', 'n/a'))}` | Content: `{esc(row.get('content_depth', 'n/a'))}`  \n"
                         f"Exclusion reason: `{esc(row.get('exclusion_reason', 'n/a'))}`  \n"
                         f"Summary: {esc(shorten(row.get('summary', 'n/a'), 220))}  \n"
                         f"Reason: {esc(shorten(row.get('reason', 'n/a'), 180))}"
@@ -2513,7 +3001,7 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     st.subheader("Public Narrative Monitor")
     st.markdown(
-        '<div class="section-note">This tab summarizes public market commentary from accessible sources. It is not bank consensus, not proprietary research and not a trading signal.</div>',
+        '<div class="section-note">This is a public narrative evidence layer based on accessible search/news results. It is not bank consensus, not proprietary research and not a trading signal.</div>',
         unsafe_allow_html=True,
     )
 
@@ -2530,30 +3018,43 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
     if "narrative_diagnostics" not in st.session_state:
         st.session_state["narrative_diagnostics"] = {}
 
-    cols = st.columns([0.8, 0.2])
-    with cols[0]:
-        enable_live_fetch = st.checkbox(
-            "Enable experimental public-source fetching",
-            value=False,
-            help="Optional RSS/API-first MVP. Disabled by default; CSV/JSON upload is the stable path.",
+    google_ready = has_google_cse_credentials()
+    source_cols = st.columns([0.27, 0.27, 0.27, 0.19])
+    with source_cols[0]:
+        use_gdelt = st.checkbox("Use GDELT news search", value=True, help="Free public news metadata/API layer. No article full-text scraping.")
+    with source_cols[1]:
+        use_google = st.checkbox(
+            "Use curated Google CSE",
+            value=google_ready,
+            disabled=not google_ready,
+            help="Uses GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID from Streamlit Secrets or environment variables.",
         )
-    with cols[1]:
+    with source_cols[2]:
+        use_rss = st.checkbox("Use official/public RSS", value=True, help="Uses only simple public feeds from the curated registry.")
+    with source_cols[3]:
         refresh_clicked = st.button("Refresh public narratives", use_container_width=True)
 
+    if not google_ready:
+        st.caption("Google CSE credentials are missing in Streamlit Secrets/env, so the app will use GDELT/RSS/CSV fallback.")
+    else:
+        st.caption("Google CSE credentials detected. Search runs only when Refresh is clicked and uses your curated Programmable Search Engine.")
+
     if refresh_clicked:
-        if enable_live_fetch:
-            st.session_state["narrative_refresh_token"] += 1
-            with st.spinner("Refreshing public narrative sources..."):
-                live_frame, failures, refreshed_at, diagnostics, raw_items = fetch_public_narratives(st.session_state["narrative_refresh_token"])
-            st.session_state["narrative_live_frame"] = live_frame
-            st.session_state["narrative_failures"] = failures
-            st.session_state["narrative_refreshed_at"] = refreshed_at
-            st.session_state["narrative_diagnostics"] = diagnostics
-            st.session_state["narrative_raw_items"] = raw_items
-            if live_frame.empty:
-                st.warning("Live public-source refresh returned no usable narrative rows. CSV/JSON data or the empty state remains available.")
-        else:
-            st.info("Live fetching is disabled. Upload narrative_monitor.csv/json or enable experimental fetching before refreshing.")
+        st.session_state["narrative_refresh_token"] += 1
+        with st.spinner("Refreshing public narrative sources..."):
+            live_frame, failures, refreshed_at, diagnostics, raw_items = fetch_public_narratives(
+                st.session_state["narrative_refresh_token"],
+                use_gdelt=use_gdelt,
+                use_google=use_google,
+                use_rss=use_rss,
+            )
+        st.session_state["narrative_live_frame"] = live_frame
+        st.session_state["narrative_failures"] = failures
+        st.session_state["narrative_refreshed_at"] = refreshed_at
+        st.session_state["narrative_diagnostics"] = diagnostics
+        st.session_state["narrative_raw_items"] = raw_items
+        if live_frame.empty and raw_items.empty:
+            st.warning("Public narrative refresh returned no usable rows. CSV/JSON data or the empty state remains available.")
 
     live_narrative = st.session_state.get("narrative_live_frame", pd.DataFrame())
     live_raw_items = st.session_state.get("narrative_raw_items", pd.DataFrame())
@@ -2569,13 +3070,13 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         all_items = normalize_loaded_narrative_items(narrative)
 
     source_count = int(details["url"].astype(str).nunique()) if not details.empty and "url" in details.columns else 0
-    fresh_count = int(details["age_days"].le(14).sum()) if not details.empty and "age_days" in details.columns else 0
+    fresh_count = int(details["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not details.empty and "age_days" in details.columns else 0
     supports = int(summary["narrative_vs_dashboard"].eq("Supports dashboard").sum()) if not summary.empty else 0
     conflicts = int(summary["narrative_vs_dashboard"].eq("Conflicts with dashboard").sum()) if not summary.empty else 0
     render_status_grid(
         [
             status_card("Narrative rows", len(details), f"{source_count} unique source links.", "info"),
-            status_card("Fresh rows", fresh_count, "Items within the last 14 days.", "good" if fresh_count else "watch"),
+            status_card("30-day rows", fresh_count, "Items inside the public narrative window.", "good" if fresh_count else "watch"),
             status_card("Supports dashboard", supports, "Narrative direction broadly aligns with signal-implied strength.", "good" if supports else "info"),
             status_card("Conflicts", conflicts, "Narrative direction conflicts with signal-implied strength.", "bad" if conflicts else "info"),
         ]
@@ -2593,11 +3094,17 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             "sources_attempted": 0,
             "sources_successful": 0,
             "sources_failed": len(st.session_state.get("narrative_failures", [])),
+            "retrieval_mode": "CSV/cache only",
+            "google_cse_status": "available" if google_ready else "missing credentials",
+            "last_refresh": st.session_state.get("narrative_refreshed_at", "n/a") or "n/a",
             "items_fetched": len(narrative),
             "items_after_dedupe": len(all_items),
-            "items_after_freshness_filter": int(all_items["age_days"].le(14).sum()) if not all_items.empty and "age_days" in all_items.columns else 0,
+            "items_within_30_days": int(all_items["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not all_items.empty and "age_days" in all_items.columns else 0,
+            "items_after_freshness_filter": int(all_items["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not all_items.empty and "age_days" in all_items.columns else 0,
             "items_with_detected_currencies": int(all_items["detected_currencies"].astype(str).str.len().gt(0).sum()) if not all_items.empty and "detected_currencies" in all_items.columns else 0,
             "items_used_in_aggregation": int(to_bool_series(details["included_in_aggregation"]).sum()) if not details.empty and "included_in_aggregation" in details.columns else 0,
+            "items_excluded": max(len(details) - int(to_bool_series(details["included_in_aggregation"]).sum()), 0) if not details.empty and "included_in_aggregation" in details.columns else 0,
+            "queries_used": [],
         }
     render_fetch_diagnostics(diagnostics, st.session_state.get("narrative_failures", []))
 
@@ -2607,7 +3114,8 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             render_narrative_source_expanders(summary, details, all_items)
         with st.expander("Curated source registry", expanded=True):
             registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
-            render_dataframe(registry[["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled"]], height=420)
+            show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
+            render_dataframe(registry[show_cols], height=420)
         return
 
     st.markdown("#### Currency narrative read")
@@ -2621,7 +3129,8 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     with st.expander("Curated source registry", expanded=False):
         registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
-        render_dataframe(registry[["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled"]], height=420)
+        show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
+        render_dataframe(registry[show_cols], height=420)
     with st.expander("Technical details: narrative aggregation"):
         render_dataframe(summary, height=320)
     with st.expander("Technical details: raw narrative rows"):

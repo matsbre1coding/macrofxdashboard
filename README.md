@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.8.1 Research Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v1.9 Public Narrative Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 
@@ -45,7 +45,16 @@ streamlit run streamlit_app.py
 
 ## Optionaler Narrative Monitor
 
-Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden.
+Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden. Alternativ kann er per Button oeffentliche Quellen ueber GDELT, einfache RSS/API-Feeds und optional die kuratierte Google Programmable Search Engine abrufen.
+
+Fuer Google Custom Search werden Secrets/Environment Variables genutzt, niemals hardcoded:
+
+```toml
+GOOGLE_SEARCH_API_KEY = "..."
+GOOGLE_SEARCH_ENGINE_ID = "..."
+```
+
+Google Search wird nur durch den Button `Refresh public narratives` im Tab gestartet, nicht automatisch beim App-Start. Wenn Credentials fehlen oder ein Quota-Fehler auftritt, faellt die App auf GDELT/RSS/CSV zurueck.
 
 Erwartete Spalten:
 
@@ -64,7 +73,7 @@ Erwartete Spalten:
 - `risks`
 - `reason`
 
-Wenn keine Narrative-Datei geladen ist, zeigt die App einen Empty State und die kuratierte Source Registry. Live-Fetching ist standardmaessig aus und muss im Tab bewusst aktiviert werden.
+Wenn keine Narrative-Datei geladen ist, zeigt die App einen Empty State und die kuratierte Source Registry. Live-Fetching startet erst nach bewusstem Refresh im Tab. Der Layer ist kein Bank Consensus, kein Proprietary Research und veraendert keine Dashboard-Scores.
 
 ## v1.2 Ansatz
 
@@ -282,12 +291,15 @@ v1.5 ist der Product-UX-Umbau:
 - Regime zeigt Scorecard vs Markov/Bayesian als Confidence Layer, nicht als automatische Trading-Maschine
 - Data Quality zeigt, welche Daten frisch oder veraltet sind und was verbessert werden muss
 
-v1.8 ergaenzt den Public Narrative Monitor:
+v1.9 baut den Public Narrative Monitor zum separaten Evidence-Layer aus:
 
 - neuer optionaler Tab `Narrative Monitor`
-- CSV/JSON-MVP fuer oeffentliche Market-Commentary-Zusammenfassungen
+- CSV/JSON-Fallback fuer oeffentliche Market-Commentary-Zusammenfassungen
+- GDELT News Search als freie breite News-Metadatenquelle
+- optionale Google Custom Search JSON API ueber Streamlit Secrets/Environment Variables
 - kuratierte Source Registry statt wildem Web-Scraping
-- optionaler Refresh Button fuer vorsichtiges RSS/API-first Live-Fetching
+- Refresh Button statt automatischem Abruf beim App-Start
+- Fetch-Diagnostics mit Quellenstatus, Query-Liste, Dedupe, Freshness und Ausschlussgruenden
 - gewichteter Public Narrative Read pro Waehrung
 - Vergleich `Narrative vs Dashboard`, ohne bestehende Macro-/Pair-/Data-Quality-Logik zu veraendern
 
