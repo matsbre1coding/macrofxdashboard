@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.9 Public Narrative Cockpit, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v1.9.1 Public Narrative Diagnostics, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 
@@ -40,12 +40,12 @@ streamlit run streamlit_app.py
 - `Currencies`: relative Waehrungsstaerke plus Datenstatus pro Waehrung.
 - `Pairs`: Watchlist, Kontext- und blockierte Pair-Ideen mit OOS- und CPI/Rates-Historie.
 - `Regime`: Scorecard als primaerer US/USD-led FX Backdrop, Markov/Bayes als Warn- und Confidence-Layer.
-- `Narrative Monitor`: optionaler Public-Narrative-Layer aus CSV/JSON oder vorsichtigem RSS/API-Refresh, inklusive Fetch-Diagnose, erkannter Waehrungen und Ausschlussgruenden. Dieser Tab ist kein Bank Consensus, kein Trading Signal und veraendert keine Dashboard-Scores.
+- `Narrative Monitor`: optionaler Public-Narrative-Layer mit 8 einfachen Waehrungskarten, Google-CSE-Teststatus und technischem Debug nur in einem geschlossenen Expander. Dieser Tab ist kein Bank Consensus, kein Trading Signal und veraendert keine Dashboard-Scores.
 - `Data Quality`: Freshness, API-/Source-Luecken und warum Signale downgraded werden.
 
 ## Optionaler Narrative Monitor
 
-Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden. Alternativ kann er per Button oeffentliche Quellen ueber GDELT, einfache RSS/API-Feeds und optional die kuratierte Google Programmable Search Engine abrufen.
+Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden. Der Refresh-Button testet in der vereinfachten Version primaer die kuratierte Google Programmable Search Engine, damit fehlgeschlagene Google-CSE-Setups nicht durch USD-only RSS-Fallback verdeckt werden.
 
 Fuer Google Custom Search werden Secrets/Environment Variables genutzt, niemals hardcoded:
 
@@ -54,7 +54,11 @@ GOOGLE_SEARCH_API_KEY = "..."
 GOOGLE_SEARCH_ENGINE_ID = "..."
 ```
 
-Google Search wird nur durch den Button `Refresh public narratives` im Tab gestartet, nicht automatisch beim App-Start. Wenn Credentials fehlen oder ein Quota-Fehler auftritt, faellt die App auf GDELT/RSS/CSV zurueck.
+Google Search wird nur durch den Button `Refresh public narratives` im Tab gestartet, nicht automatisch beim App-Start. Der Tab zeigt oben nur Data-Source-Status, Google-Status, Last Refresh und Items Used. Fehler aus der Google Custom Search JSON API werden mit HTTP-Code, Google-Status, Message und Reason angezeigt, zum Beispiel `keyInvalid`, `accessNotConfigured`, `quotaExceeded`, `invalid cx / request argument` oder `referer/IP restriction`.
+
+GDELT bleibt standardmaessig aus. Der Code bricht bei HTTP 429 sauber mit `rate limited` ab, statt eine Fehlerseite als JSON zu parsen.
+
+Wenn nur Fed-/NY-Fed-RSS geladen wurde, zeigt der Narrative Monitor explizit: `RSS fallback loaded USD-only sources.` Nicht-USD-Waehrungen werden dann nicht kuenstlich als abgedeckt gewertet.
 
 Erwartete Spalten:
 
@@ -291,16 +295,18 @@ v1.5 ist der Product-UX-Umbau:
 - Regime zeigt Scorecard vs Markov/Bayesian als Confidence Layer, nicht als automatische Trading-Maschine
 - Data Quality zeigt, welche Daten frisch oder veraltet sind und was verbessert werden muss
 
-v1.9 baut den Public Narrative Monitor zum separaten Evidence-Layer aus:
+v1.9.2 vereinfacht den Public Narrative Monitor wieder zu einem stabilen Evidence-Check:
 
 - neuer optionaler Tab `Narrative Monitor`
 - CSV/JSON-Fallback fuer oeffentliche Market-Commentary-Zusammenfassungen
-- GDELT News Search als freie breite News-Metadatenquelle
-- optionale Google Custom Search JSON API ueber Streamlit Secrets/Environment Variables
+- Google Custom Search JSON API ueber Streamlit Secrets/Environment Variables als primaerer Test
+- GDELT ist standardmaessig aus und nur noch als spaeterer, rate-limitierter Fallback gedacht
 - kuratierte Source Registry statt wildem Web-Scraping
 - Refresh Button statt automatischem Abruf beim App-Start
-- Fetch-Diagnostics mit Quellenstatus, Query-Liste, Dedupe, Freshness und Ausschlussgruenden
-- gewichteter Public Narrative Read pro Waehrung
+- nur 8 kompakte Waehrungskarten im Hauptbereich
+- Google-Teststatus und Fehlerdetails direkt oben sichtbar
+- technische Details nur noch in einem geschlossenen `Technical debug` Expander
+- gewichteter Public Narrative Read pro Waehrung, nur wenn brauchbare Suchdaten vorliegen
 - Vergleich `Narrative vs Dashboard`, ohne bestehende Macro-/Pair-/Data-Quality-Logik zu veraendern
 
 ## Naechste sinnvolle Schritte

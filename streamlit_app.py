@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,7 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.9 Public Narrative Cockpit"
+APP_VERSION = "v1.9.2 Simplified Narrative Monitor"
 
 
 st.set_page_config(
@@ -105,6 +106,8 @@ PUBLIC_NARRATIVE_LOOKBACK_DAYS = 30
 PUBLIC_NARRATIVE_CACHE_TTL_SECONDS = 21600
 GOOGLE_CSE_RESULTS_PER_QUERY = 5
 GOOGLE_CSE_MAX_RESULTS_PER_REFRESH = 120
+GDELT_MAX_QUERIES_PER_REFRESH = 8
+GDELT_REQUEST_PAUSE_SECONDS = 0.75
 
 
 PUBLIC_NARRATIVE_QUERIES = {
@@ -1428,6 +1431,20 @@ def detected_currency_string(value: object, fallback: object = "") -> str:
     return ", ".join(currencies)
 
 
+def currencies_from_frame(frame: pd.DataFrame, retrieval_sources: set[str] | None = None) -> list[str]:
+    if frame.empty:
+        return []
+    work = frame.copy()
+    if retrieval_sources and "retrieval_source" in work.columns:
+        work = work[work["retrieval_source"].isin(retrieval_sources)]
+    found: set[str] = set()
+    for _, row in work.iterrows():
+        for column in ["detected_currencies", "currency"]:
+            for currency in extract_currencies(row.get(column, "")):
+                found.add(currency)
+    return sorted(found)
+
+
 def normalize_label(value: object, allowed: set[str], default: str) -> str:
     text = safe_text(value, default).strip()
     if not text:
@@ -1469,6 +1486,71 @@ def source_domain(url: object) -> str:
     parsed = urllib.parse.urlparse(safe_text(url, ""))
     domain = parsed.netloc or safe_text(url, "")
     return domain.replace("www.", "") or "unknown source"
+
+
+def parse_http_error_details(exc: urllib.error.HTTPError) -> dict:
+    body = ""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+
+    details = {
+        "http_status": getattr(exc, "code", ""),
+        "error": shorten(str(exc), 220),
+        "error_body": shorten(body, 500),
+        "google_error_code": "",
+        "google_error_message": "",
+        "google_error_status": "",
+        "google_error_reason": "",
+    }
+    if body:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
+        google_error = payload.get("error", {}) if isinstance(payload, dict) else {}
+        if isinstance(google_error, dict):
+            nested_errors = google_error.get("errors", [])
+            reasons = []
+            if isinstance(nested_errors, list):
+                for item in nested_errors:
+                    if isinstance(item, dict) and item.get("reason"):
+                        reasons.append(safe_text(item.get("reason")))
+            details.update(
+                {
+                    "google_error_code": safe_text(google_error.get("code", "")),
+                    "google_error_message": safe_text(google_error.get("message", "")),
+                    "google_error_status": safe_text(google_error.get("status", "")),
+                    "google_error_reason": ", ".join(dict.fromkeys(reasons)),
+                }
+            )
+            if details["google_error_message"]:
+                details["error"] = shorten(details["google_error_message"], 220)
+    return details
+
+
+def google_status_from_error(details: dict) -> str:
+    reason = safe_text(details.get("google_error_reason", "")).lower()
+    message = safe_text(details.get("google_error_message", details.get("error", ""))).lower()
+    http_status = safe_text(details.get("http_status", ""))
+    if any(token in reason for token in ["keyinvalid", "keyexpired"]) or "api key not valid" in message:
+        return "keyInvalid"
+    if "accessnotconfigured" in reason or "has not been used" in message or "not enabled" in message:
+        return "accessNotConfigured"
+    if any(token in reason for token in ["dailylimitexceeded", "quotaexceeded", "userratelimitexceeded", "ratelimitexceeded"]):
+        return "quotaExceeded"
+    if http_status in ["429"]:
+        return "quotaExceeded"
+    if any(token in reason for token in ["referernotallowed", "iprefererblocked", "forbidden"]):
+        return "referer/IP restriction"
+    if http_status == "400" and ("invalid" in message or "argument" in message or "badrequest" in reason):
+        return "invalid cx / request argument"
+    if "cx" in message or "custom search engine" in message or "invalid value" in message:
+        return "invalid cx / failed"
+    if http_status:
+        return f"http {http_status} failed"
+    return "failed"
 
 
 def narrative_age_days(value: object) -> float:
@@ -1673,6 +1755,10 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "neutral_mixed_sources": 0,
                 "latest_source_date": "n/a",
                 "source_count": 0,
+                "search_source_count": 0,
+                "rss_source_count": 0,
+                "retrieval_sources": "n/a",
+                "coverage_note": "No public search evidence retrieved for this currency.",
                 "main_drivers": "n/a",
                 "main_themes": "n/a",
                 "supporting_arguments": "n/a",
@@ -1702,6 +1788,14 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
     strength_map = {}
     if not strength.empty and {"currency", "strength"}.issubset(strength.columns):
         strength_map = dict(zip(strength["currency"].astype(str).str.upper(), pd.to_numeric(strength["strength"], errors="coerce").fillna(0.0)))
+    has_global_search_rows = False
+    has_global_rss_rows = False
+    global_rss_currencies: list[str] = []
+    if "retrieval_source" in details.columns:
+        has_global_search_rows = bool(details["retrieval_source"].isin(["Google CSE", "GDELT"]).any())
+        has_global_rss_rows = bool(details["retrieval_source"].eq("RSS").any())
+        global_rss_currencies = currencies_from_frame(details, {"RSS"})
+    global_rss_only_usd = bool(has_global_rss_rows and not has_global_search_rows and global_rss_currencies and set(global_rss_currencies).issubset({"USD"}))
 
     summary_rows = []
     for currency in sorted(FX_CURRENCIES):
@@ -1709,9 +1803,14 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         fresh_rows = rows[rows["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS)]
         used_rows = rows[to_bool_series(rows["included_in_aggregation"])] if not rows.empty else rows
         working = used_rows if not used_rows.empty else (fresh_rows if not fresh_rows.empty else rows)
+        retrieval_sources = sorted(rows["retrieval_source"].dropna().astype(str).unique().tolist()) if not rows.empty and "retrieval_source" in rows.columns else []
+        search_rows = rows[rows["retrieval_source"].isin(["Google CSE", "GDELT"])] if not rows.empty and "retrieval_source" in rows.columns else rows.iloc[0:0]
+        rss_rows = rows[rows["retrieval_source"].eq("RSS")] if not rows.empty and "retrieval_source" in rows.columns else rows.iloc[0:0]
         source_count = int(len(rows))
         fresh_count = int(len(fresh_rows))
         used_count = int(len(used_rows))
+        search_source_count = int(len(search_rows))
+        rss_source_count = int(len(rss_rows))
         bullish_sources = int(used_rows["direction"].eq("Bullish").sum()) if not used_rows.empty else 0
         bearish_sources = int(used_rows["direction"].eq("Bearish").sum()) if not used_rows.empty else 0
         neutral_mixed_sources = int(working["direction"].isin(["Neutral", "Mixed"]).sum()) if not working.empty else 0
@@ -1764,8 +1863,10 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         weak_clues = top_texts(rows.sort_values("age_days"), ["title", "summary", "reason"], limit=3) if not rows.empty else "n/a"
         loaded_titles = top_texts(rows.sort_values("age_days"), ["title"], limit=4) if not rows.empty else "n/a"
         if used_count < 3:
-            if rows.empty:
-                why_no_firm_read = "No loaded source detected this currency."
+            if rows.empty and global_rss_only_usd:
+                why_no_firm_read = "Only USD RSS fallback sources loaded; no public search evidence was retrieved for this currency."
+            elif rows.empty:
+                why_no_firm_read = "No public search evidence retrieved for this currency."
             elif fresh_count < 3:
                 why_no_firm_read = f"Only {fresh_count} item(s) inside the 30-day window; at least 3 usable items are required."
             else:
@@ -1776,6 +1877,19 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
             why_no_firm_read = "Loaded sources do not produce a clear directional public narrative."
         else:
             why_no_firm_read = "A directional public narrative exists, but it remains research context only."
+
+        if global_rss_only_usd and search_source_count == 0 and (source_count == 0 or currency != "USD"):
+            coverage_note = "Only USD RSS fallback sources loaded."
+        elif search_source_count == 0 and source_count == 0:
+            coverage_note = "No public search evidence retrieved for this currency."
+        elif search_source_count == 0 and rss_source_count > 0 and currency == "USD":
+            coverage_note = "Only USD RSS fallback sources loaded."
+        elif search_source_count == 0 and rss_source_count > 0:
+            coverage_note = "Only RSS fallback sources loaded; no Google/GDELT evidence for this currency."
+        elif search_source_count == 0:
+            coverage_note = "No Google/GDELT evidence retrieved for this currency."
+        else:
+            coverage_note = "Public search evidence available."
 
         summary_rows.append(
             {
@@ -1788,6 +1902,10 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
                 "neutral_mixed_sources": neutral_mixed_sources,
                 "latest_source_date": latest_date,
                 "source_count": source_count,
+                "search_source_count": search_source_count,
+                "rss_source_count": rss_source_count,
+                "retrieval_sources": ", ".join(retrieval_sources) if retrieval_sources else "n/a",
+                "coverage_note": coverage_note,
                 "fresh_source_count": fresh_count,
                 "used_source_count": used_count,
                 "main_drivers": ", ".join(top_drivers) if top_drivers else "n/a",
@@ -2128,76 +2246,122 @@ def fetch_google_cse_items(api_key: str, engine_id: str) -> tuple[list[dict], li
     query_rows: list[dict] = []
     total_results = 0
     status = "available"
-    for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
-        for query in queries[:3]:
-            if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH:
-                break
-            params = {
-                "key": api_key,
-                "cx": engine_id,
-                "q": query,
-                "num": GOOGLE_CSE_RESULTS_PER_QUERY,
-                "dateRestrict": "m1",
-            }
-            url = "https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode(params)
-            query_status = "attempted"
-            try:
-                payload = fetch_json(url, timeout=10)
-                items = payload.get("items", []) if isinstance(payload, dict) else []
-                query_status = f"{len(items)} result(s)"
-                for item in items[:GOOGLE_CSE_RESULTS_PER_QUERY]:
-                    result_url = safe_text(item.get("link", ""))
-                    title = clean_feed_text(item.get("title", ""))
-                    summary = clean_feed_text(item.get("snippet", ""))
-                    published_at = extract_google_item_date(item)
-                    source_name = safe_text(item.get("displayLink", "")) or source_domain(result_url)
-                    source = {
+    google_abort = False
+
+    def run_google_query(currency: str, query: str, test_query: bool = False) -> None:
+        nonlocal total_results, status, google_abort
+        if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH or google_abort:
+            return
+        params = {
+            "key": api_key,
+            "cx": engine_id,
+            "q": query,
+            "num": GOOGLE_CSE_RESULTS_PER_QUERY,
+            "dateRestrict": "m1",
+        }
+        url = "https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode(params)
+        query_status = "attempted"
+        query_result_count = 0
+        try:
+            payload = fetch_json(url, timeout=10)
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            query_status = f"{len(items)} result(s)"
+            query_result_count = len(items)
+            for item in items[:GOOGLE_CSE_RESULTS_PER_QUERY]:
+                result_url = safe_text(item.get("link", ""))
+                title = clean_feed_text(item.get("title", ""))
+                summary = clean_feed_text(item.get("snippet", ""))
+                published_at = extract_google_item_date(item)
+                source_name = safe_text(item.get("displayLink", "")) or source_domain(result_url)
+                source = {
+                    "source_name": source_name,
+                    "source_type": "Established financial media/search result",
+                    "coverage": currency,
+                    "retrieval_source": "Google CSE",
+                    "content_depth": "public_page_snippet",
+                }
+                detection_text = f"{title} {summary} {currency}"
+                raw_rows.append(
+                    {
+                        "currency": currency,
+                        "detected_currencies": detected_currency_string(detection_text, currency),
                         "source_name": source_name,
-                        "source_type": "Established financial media/search result",
-                        "coverage": currency,
+                        "source_type": source["source_type"],
+                        "title": title,
+                        "url": result_url,
+                        "published_at": published_at,
+                        "snippet_or_summary": shorten(summary, 320),
+                        "summary": shorten(summary, 320),
+                        "driver_tags": ", ".join(extract_driver_tags(detection_text)),
+                        "direction": "Neutral",
+                        "sentiment": "Neutral",
+                        "confidence": "Low",
+                        "relevance": classify_relevance(source["source_type"], detection_text, True),
+                        "horizon": classify_horizon(detection_text),
+                        "evidence_strength": "Weak",
+                        "themes": "public commentary",
+                        "supports": "",
+                        "risks": "",
+                        "reason": "Google CSE search result snippet; no article full text fetched.",
                         "retrieval_source": "Google CSE",
                         "content_depth": "public_page_snippet",
                     }
-                    detection_text = f"{title} {summary} {currency}"
-                    raw_rows.append(
-                        {
-                            "currency": currency,
-                            "detected_currencies": detected_currency_string(detection_text, currency),
-                            "source_name": source_name,
-                            "source_type": source["source_type"],
-                            "title": title,
-                            "url": result_url,
-                            "published_at": published_at,
-                            "snippet_or_summary": shorten(summary, 320),
-                            "summary": shorten(summary, 320),
-                            "driver_tags": ", ".join(extract_driver_tags(detection_text)),
-                            "direction": "Neutral",
-                            "sentiment": "Neutral",
-                            "confidence": "Low",
-                            "relevance": classify_relevance(source["source_type"], detection_text, True),
-                            "horizon": classify_horizon(detection_text),
-                            "evidence_strength": "Weak",
-                            "themes": "public commentary",
-                            "supports": "",
-                            "risks": "",
-                            "reason": "Google CSE search result snippet; no article full text fetched.",
-                            "retrieval_source": "Google CSE",
-                            "content_depth": "public_page_snippet",
-                        }
-                    )
-                    classified_rows.extend(classify_public_item(source, title, summary, published_at, result_url))
-                total_results += len(items)
-            except urllib.error.HTTPError as exc:
-                error_text = shorten(str(exc), 180)
-                status = "quota error / failed" if exc.code in [403, 429] else "failed"
-                query_status = status
-                failures.append({"source_name": "Google Custom Search JSON API", "source_type": "Curated search", "url": "https://www.googleapis.com/customsearch/v1", "error": error_text})
-            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-                status = "failed"
-                query_status = "failed"
-                failures.append({"source_name": "Google Custom Search JSON API", "source_type": "Curated search", "url": "https://www.googleapis.com/customsearch/v1", "error": shorten(str(exc), 180)})
-            query_rows.append({"retrieval_source": "Google CSE", "currency": currency, "query": query, "status": query_status})
-        if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH:
+                )
+                classified_rows.extend(classify_public_item(source, title, summary, published_at, result_url))
+            total_results += len(items)
+        except urllib.error.HTTPError as exc:
+            error_details = parse_http_error_details(exc)
+            status = google_status_from_error(error_details)
+            query_result_count = 0
+            query_status = status
+            if status in ["keyInvalid", "accessNotConfigured", "quotaExceeded", "invalid cx / failed", "invalid cx / request argument", "referer/IP restriction"]:
+                google_abort = True
+            failures.append(
+                {
+                    "source_name": "Google Custom Search JSON API",
+                    "source_type": "Curated search",
+                    "url": "https://www.googleapis.com/customsearch/v1",
+                    "currency": currency,
+                    "query": query,
+                    "diagnostic_status": status,
+                    **error_details,
+                }
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            status = "failed"
+            query_status = "failed"
+            failures.append(
+                {
+                    "source_name": "Google Custom Search JSON API",
+                    "source_type": "Curated search",
+                    "url": "https://www.googleapis.com/customsearch/v1",
+                    "currency": currency,
+                    "query": query,
+                    "diagnostic_status": status,
+                    "error": shorten(str(exc), 180),
+                }
+            )
+        query_rows.append(
+            {
+                "retrieval_source": "Google CSE",
+                "currency": currency,
+                "query": query,
+                "status": query_status,
+                "result_count": query_result_count,
+                "test_query": bool(test_query),
+            }
+        )
+
+    run_google_query("EUR", "EUR forex outlook", test_query=True)
+
+    for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
+        if google_abort:
+            break
+        for query in queries[:3]:
+            if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH or google_abort:
+                break
+            run_google_query(currency, query)
+        if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH or google_abort:
             break
     return raw_rows, classified_rows, failures, query_rows, status
 
@@ -2209,8 +2373,15 @@ def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]
     query_rows: list[dict] = []
     end_dt = pd.Timestamp.now(tz="UTC")
     start_dt = end_dt - pd.Timedelta(days=PUBLIC_NARRATIVE_LOOKBACK_DAYS)
+    query_count = 0
+    rate_limited = False
     for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
-        for query in queries[:2]:
+        if query_count >= GDELT_MAX_QUERIES_PER_REFRESH or rate_limited:
+            break
+        for query in queries[:1]:
+            if query_count >= GDELT_MAX_QUERIES_PER_REFRESH or rate_limited:
+                break
+            query_count += 1
             gdelt_query = f'({query}) forex currency outlook'
             params = {
                 "query": gdelt_query,
@@ -2223,10 +2394,12 @@ def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]
             }
             url = "https://api.gdeltproject.org/api/v2/doc/doc?" + urllib.parse.urlencode(params)
             query_status = "attempted"
+            query_result_count = 0
             try:
                 payload = fetch_json(url, timeout=10)
                 articles = payload.get("articles", []) if isinstance(payload, dict) else []
                 query_status = f"{len(articles)} result(s)"
+                query_result_count = len(articles)
                 for article in articles:
                     result_url = safe_text(article.get("url", ""))
                     title = clean_feed_text(article.get("title", ""))
@@ -2268,10 +2441,56 @@ def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]
                         }
                     )
                     classified_rows.extend(classify_public_item(source, title, summary, published_text, result_url))
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            except urllib.error.HTTPError as exc:
+                error_details = parse_http_error_details(exc)
+                if getattr(exc, "code", None) == 429:
+                    query_status = "rate limited"
+                    rate_limited = True
+                    error_details["error"] = "GDELT rate limited the request. Refresh later or leave GDELT disabled while testing Google CSE."
+                    error_details["diagnostic_status"] = "rate limited"
+                else:
+                    query_status = f"http {getattr(exc, 'code', '')} failed"
+                    error_details["diagnostic_status"] = query_status
+                failures.append(
+                    {
+                        "source_name": "GDELT DOC API",
+                        "source_type": "News metadata API",
+                        "url": "https://api.gdeltproject.org/api/v2/doc/doc",
+                        "currency": currency,
+                        "query": query,
+                        **error_details,
+                    }
+                )
+            except json.JSONDecodeError as exc:
+                query_status = "invalid json"
+                failures.append(
+                    {
+                        "source_name": "GDELT DOC API",
+                        "source_type": "News metadata API",
+                        "url": "https://api.gdeltproject.org/api/v2/doc/doc",
+                        "currency": currency,
+                        "query": query,
+                        "diagnostic_status": query_status,
+                        "error": "GDELT returned a non-JSON response; request was not used.",
+                        "error_detail": shorten(str(exc), 180),
+                    }
+                )
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 query_status = "failed"
-                failures.append({"source_name": "GDELT DOC API", "source_type": "News metadata API", "url": "https://api.gdeltproject.org/api/v2/doc/doc", "error": shorten(str(exc), 180)})
-            query_rows.append({"retrieval_source": "GDELT", "currency": currency, "query": query, "status": query_status})
+                failures.append(
+                    {
+                        "source_name": "GDELT DOC API",
+                        "source_type": "News metadata API",
+                        "url": "https://api.gdeltproject.org/api/v2/doc/doc",
+                        "currency": currency,
+                        "query": query,
+                        "diagnostic_status": query_status,
+                        "error": shorten(str(exc), 180),
+                    }
+                )
+            query_rows.append({"retrieval_source": "GDELT", "currency": currency, "query": query, "status": query_status, "result_count": query_result_count})
+            if not rate_limited and query_count < GDELT_MAX_QUERIES_PER_REFRESH:
+                time.sleep(GDELT_REQUEST_PAUSE_SECONDS)
     return raw_rows, classified_rows, failures, query_rows
 
 
@@ -2339,6 +2558,16 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
     normalized_details = normalize_narrative_frame(classified_frame)
     normalized_raw_count = len(normalized_raw)
     details_used = int(to_bool_series(normalized_details["included_in_aggregation"]).sum()) if not normalized_details.empty and "included_in_aggregation" in normalized_details.columns else 0
+    retrieval_source_counts = normalized_raw["retrieval_source"].value_counts().to_dict() if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else {}
+    search_items = int(normalized_raw["retrieval_source"].isin(["Google CSE", "GDELT"]).sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    google_items = int(normalized_raw["retrieval_source"].eq("Google CSE").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    gdelt_items = int(normalized_raw["retrieval_source"].eq("GDELT").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    rss_items = int(normalized_raw["retrieval_source"].eq("RSS").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    loaded_currencies = currencies_from_frame(normalized_raw)
+    search_currencies = currencies_from_frame(normalized_raw, {"Google CSE", "GDELT"})
+    rss_currencies = currencies_from_frame(normalized_raw, {"RSS"})
+    rss_only_usd = bool(rss_items and search_items == 0 and rss_currencies and set(rss_currencies).issubset({"USD"}))
+    coverage_note = "RSS fallback only returned USD-related sources." if rss_only_usd else ""
     diagnostics = {
         "retrieval_mode": " + ".join(retrieval_modes) if retrieval_modes else "CSV/cache only",
         "google_cse_status": google_status,
@@ -2354,6 +2583,15 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
         "items_with_detected_currencies": int(normalized_raw["detected_currencies"].astype(str).str.len().gt(0).sum()) if not normalized_raw.empty and "detected_currencies" in normalized_raw.columns else 0,
         "items_used_in_aggregation": details_used,
         "items_excluded": max(len(normalized_details) - details_used, 0),
+        "retrieval_source_counts": retrieval_source_counts,
+        "google_cse_items": google_items,
+        "gdelt_items": gdelt_items,
+        "rss_items": rss_items,
+        "public_search_items": search_items,
+        "loaded_currency_coverage": ", ".join(loaded_currencies) if loaded_currencies else "none",
+        "public_search_currency_coverage": ", ".join(search_currencies) if search_currencies else "none",
+        "rss_currency_coverage": ", ".join(rss_currencies) if rss_currencies else "none",
+        "rss_only_usd_warning": coverage_note,
         "queries_used": query_rows,
         "configured_curated_domains": "Managed in Google Programmable Search Engine; RSS registry shown below.",
     }
@@ -2873,124 +3111,222 @@ def data_quality_view(frames: Dict[str, pd.DataFrame]) -> None:
         render_dataframe(permission, height=340)
 
 
-def render_narrative_cards(summary: pd.DataFrame) -> None:
-    cards = []
-    for _, row in summary.sort_values("currency").iterrows():
-        sentiment = safe_text(row.get("sentiment", "Not enough data"))
-        tone = narrative_tone(sentiment)
-        dashboard_read = safe_text(row.get("narrative_vs_dashboard", "Not enough data"))
-        cards.append(
-            (
-                f'<div class="narrative-card tone-{tone}">'
-                f'<div class="ccy">{esc(row.get("currency"))}</div>'
-                f'<div class="sentiment">{esc(sentiment)}</div>'
-                f'<span class="pill pill-{tone if tone in ["good", "bad", "info"] else "watch"}">{esc(row.get("confidence", "Low"))} confidence</span>'
-                f'<div class="line">Weighted narrative score: <strong>{to_float(row.get("weighted_score")):+.2f}</strong></div>'
-                f'<div class="line">Sources: {esc(row.get("source_count", 0))} | Latest: {esc(row.get("latest_source_date", "n/a"))}</div>'
-                f'<div class="line">Used / fresh: {esc(row.get("used_source_count", 0))} / {esc(row.get("fresh_source_count", 0))}</div>'
-                f'<div class="line">Bullish / Bearish / Neutral-Mixed: {esc(row.get("bullish_sources", 0))} / {esc(row.get("bearish_sources", 0))} / {esc(row.get("neutral_mixed_sources", 0))}</div>'
-                f'<div class="label">Main drivers</div><div class="mini">{esc(shorten(row.get("main_drivers", "n/a"), 130))}</div>'
-                f'<div class="label">Main themes</div><div class="mini">{esc(shorten(row.get("main_themes", "n/a"), 130))}</div>'
-                f'<div class="label">Support / opposition</div><div class="mini">{esc(shorten(row.get("supporting_arguments", "n/a"), 120))} / {esc(shorten(row.get("opposing_arguments", "n/a"), 120))}</div>'
-                f'<div class="label">Weak clues</div><div class="mini">{esc(shorten(row.get("weak_clues", "n/a"), 150))}</div>'
-                f'<div class="label">Why no firm read?</div><div class="mini">{esc(shorten(row.get("why_no_firm_read", "n/a"), 150))}</div>'
-                f'<div class="label">Narrative vs Dashboard</div><div class="mini">{esc(dashboard_read)}</div>'
-                "</div>"
-            )
-        )
-    st.markdown(f'<div class="narrative-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+def narrative_display_label(sentiment: object) -> str:
+    value = safe_text(sentiment, "Not enough data")
+    if value in ["Not enough data", ""]:
+        return "No data"
+    return value
 
 
-def render_fetch_diagnostics(diagnostics: dict, failures: list[dict]) -> None:
-    st.markdown("#### Fetch diagnostics")
-    diagnostic_cards = [
-        status_card("Retrieval mode", diagnostics.get("retrieval_mode", "CSV/cache only"), "Narrative retrieval layer used on last refresh.", "info"),
-        status_card("Google CSE status", diagnostics.get("google_cse_status", "missing credentials"), "Uses Streamlit Secrets/env only; never hardcoded.", "good" if diagnostics.get("google_cse_status") == "available" else "watch"),
-        status_card("Last refresh", diagnostics.get("last_refresh", "n/a"), "Refresh happens only when clicked.", "info"),
-        status_card("Sources configured", diagnostics.get("sources_configured", len(PUBLIC_NARRATIVE_SOURCE_REGISTRY)), "Curated public source registry.", "info"),
-        status_card("Sources attempted", diagnostics.get("sources_attempted", 0), "Only fetch-enabled sources are attempted.", "info"),
-        status_card("Sources successful", diagnostics.get("sources_successful", 0), "Returned a readable feed/API response.", "good" if diagnostics.get("sources_successful", 0) else "watch"),
-        status_card("Sources failed", diagnostics.get("sources_failed", len(failures)), "Errors are shown below.", "bad" if failures else "good"),
-        status_card("Items fetched", diagnostics.get("items_fetched", 0), "Raw public-source items before classification.", "info"),
-        status_card("Items after dedupe", diagnostics.get("items_after_dedupe", 0), "Unique by URL/title.", "info"),
-        status_card("Within 30 days", diagnostics.get("items_within_30_days", diagnostics.get("items_after_freshness_filter", 0)), "Items inside the public narrative window.", "good" if diagnostics.get("items_within_30_days", diagnostics.get("items_after_freshness_filter", 0)) else "watch"),
-        status_card("Detected currencies", diagnostics.get("items_with_detected_currencies", 0), "Items with at least one FX currency clue.", "good" if diagnostics.get("items_with_detected_currencies", 0) else "watch"),
-        status_card("Used in aggregation", diagnostics.get("items_used_in_aggregation", 0), "Fresh, detected and not weak mention.", "good" if diagnostics.get("items_used_in_aggregation", 0) else "watch"),
-        status_card("Excluded", diagnostics.get("items_excluded", 0), "Items shown in details but not used for firm aggregation.", "watch" if diagnostics.get("items_excluded", 0) else "good"),
+def google_failure_summary(failures: list[dict]) -> dict:
+    google_failures = [
+        failure
+        for failure in failures
+        if "google" in safe_text(failure.get("source_name", "")).lower()
+        or "customsearch" in safe_text(failure.get("url", "")).lower()
     ]
-    render_status_grid(diagnostic_cards)
+    if not google_failures:
+        return {}
+    failure = google_failures[0]
+    message = safe_text(failure.get("google_error_message") or failure.get("error") or "Google CSE failed.")
+    return {
+        "status": safe_text(failure.get("diagnostic_status", "failed")),
+        "code": safe_text(failure.get("google_error_code", "")),
+        "message": message,
+        "google_status": safe_text(failure.get("google_error_status", "")),
+        "reason": safe_text(failure.get("google_error_reason", "")),
+        "query": safe_text(failure.get("query", "")),
+    }
+
+
+def google_test_summary(diagnostics: dict, failures: list[dict]) -> dict:
     queries = diagnostics.get("queries_used", [])
-    if queries:
-        with st.expander("Queries used", expanded=False):
-            render_dataframe(pd.DataFrame(queries), height=320)
-    with st.expander("Configured curated source domains", expanded=False):
-        st.caption(safe_text(diagnostics.get("configured_curated_domains", "Google CSE domains are managed inside your Programmable Search Engine.")))
-        registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
-        if not registry.empty:
-            show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
-            render_dataframe(registry[show_cols], height=300)
-    if failures:
-        with st.expander("Failed source errors", expanded=False):
-            render_dataframe(pd.DataFrame(failures), height=260)
+    test_row = {}
+    if isinstance(queries, list):
+        test_rows = [row for row in queries if bool(row.get("test_query"))] if queries else []
+        google_rows = [row for row in queries if row.get("retrieval_source") == "Google CSE"] if queries else []
+        test_row = (test_rows or google_rows or [{}])[0]
+    failure = google_failure_summary(failures)
+    return {
+        "credentials": "yes" if has_google_cse_credentials() else "no",
+        "query": safe_text(test_row.get("query", "EUR forex outlook")),
+        "result_count": int(to_float(test_row.get("result_count", 0), 0)),
+        "status": safe_text(test_row.get("status") or diagnostics.get("google_cse_status", "n/a")),
+        "error": failure,
+    }
 
 
-def render_narrative_source_expanders(summary: pd.DataFrame, details: pd.DataFrame, all_items: pd.DataFrame) -> None:
-    st.markdown("#### Source details")
-    if not all_items.empty:
-        show_cols = [
-            col
-            for col in [
-                "source_name",
-                "source_type",
-                "title",
-                "published_at",
-                "retrieval_source",
-                "content_depth",
-                "detected_currencies",
-                "driver_tags",
-                "direction",
-                "sentiment",
-                "confidence",
-                "relevance",
-                "horizon",
-                "evidence_strength",
-                "included_in_aggregation",
-                "exclusion_reason",
-                "url",
-            ]
-            if col in all_items.columns
+def render_simple_narrative_status(diagnostics: dict, failures: list[dict], data_source: str) -> None:
+    google_status = safe_text(diagnostics.get("google_cse_status", "missing credentials"))
+    public_search_items = int(to_float(diagnostics.get("public_search_items", 0), 0))
+    items_used = int(to_float(diagnostics.get("items_used_in_aggregation", 0), 0))
+    if public_search_items > 0:
+        source_status = "Google search evidence loaded"
+        source_tone = "good"
+    elif diagnostics.get("rss_only_usd_warning"):
+        source_status = "RSS fallback loaded USD-only sources"
+        source_tone = "watch"
+    elif data_source == "Live public-source cache":
+        source_status = "No usable public narrative data"
+        source_tone = "bad"
+    else:
+        source_status = "CSV/local data"
+        source_tone = "info"
+
+    render_status_grid(
+        [
+            status_card("Data source status", source_status, "Narrative does not change dashboard signals.", source_tone),
+            status_card("Google status", google_status, "CSE is the primary broad-source layer.", "good" if google_status == "available" and public_search_items else "watch"),
+            status_card("Last refresh", diagnostics.get("last_refresh", "n/a"), "Refresh runs only when clicked.", "info"),
+            status_card("Items used", items_used, "Rows that pass freshness/relevance checks.", "good" if items_used else "watch"),
         ]
-        with st.expander("All loaded source items, including excluded items", expanded=False):
-            render_dataframe(all_items[show_cols], height=420)
-    for currency in summary.sort_values("currency")["currency"].tolist():
-        rows = details[details["currency"].eq(currency)].copy() if not details.empty and "currency" in details.columns else pd.DataFrame()
-        label = f"{currency} sources"
-        if rows.empty:
-            with st.expander(label, expanded=False):
-                st.info("No public narrative data loaded for this currency.")
-            continue
-        rows = rows.sort_values(["published_dt", "weighted_source_score"], ascending=[False, False], na_position="last").head(12)
-        with st.expander(label, expanded=False):
-            for _, row in rows.iterrows():
-                title = safe_text(row.get("title", "Untitled public item"))
-                url = safe_text(row.get("url", ""))
-                link = f"[{esc(title)}]({url})" if url else f"**{esc(title)}**"
-                published = row.get("published_dt")
-                date_text = "n/a" if pd.isna(published) else str(pd.to_datetime(published).date())
+    )
+
+    test = google_test_summary(diagnostics, failures)
+    st.caption(
+        f"Google credentials detected: {test['credentials']} | Test query: {test['query']} | "
+        f"Result count: {test['result_count']} | Query status: {test['status']}"
+    )
+    if test["error"]:
+        error = test["error"]
+        detail = " | ".join(
+            part
+            for part in [
+                f"status={error.get('status')}",
+                f"code={error.get('code')}" if error.get("code") else "",
+                f"google_status={error.get('google_status')}" if error.get("google_status") else "",
+                f"reason={error.get('reason')}" if error.get("reason") else "",
+                f"message={error.get('message')}" if error.get("message") else "",
+            ]
+            if part
+        )
+        st.warning(f"Google CSE failed. {detail}")
+
+
+def narrative_card_explanation(row: pd.Series, force_no_search: bool = False) -> str:
+    if force_no_search:
+        return "No Google search evidence retrieved."
+    coverage = safe_text(row.get("coverage_note", ""))
+    if "Only USD RSS" in coverage:
+        return "Only USD RSS fallback sources loaded."
+    why = safe_text(row.get("why_no_firm_read", ""))
+    if why and why != "n/a":
+        return shorten(why, 130)
+    themes = safe_text(row.get("main_themes", ""))
+    if themes and themes != "n/a":
+        return shorten(themes, 130)
+    return "No firm public narrative read."
+
+
+def render_currency_source_items(currency: str, details: pd.DataFrame, no_search_message: str = "") -> None:
+    rows = details[details["currency"].eq(currency)].copy() if not details.empty and "currency" in details.columns else pd.DataFrame()
+    if rows.empty:
+        st.info(no_search_message or "No public narrative evidence loaded for this currency.")
+        return
+    sort_cols = [col for col in ["included_in_aggregation", "published_dt", "weighted_source_score"] if col in rows.columns]
+    if sort_cols:
+        ascending = [False if col in ["included_in_aggregation", "published_dt", "weighted_source_score"] else True for col in sort_cols]
+        rows = rows.sort_values(sort_cols, ascending=ascending, na_position="last")
+    rows = rows.head(10)
+    for _, row in rows.iterrows():
+        title = safe_text(row.get("title", "Untitled public item"))
+        url = safe_text(row.get("url", ""))
+        source = safe_text(row.get("source_name", "n/a"))
+        published = row.get("published_dt")
+        date_text = "n/a" if pd.isna(published) else str(pd.to_datetime(published).date())
+        direction = safe_text(row.get("direction", row.get("sentiment", "Neutral")))
+        reason = shorten(row.get("reason", row.get("summary", "n/a")), 180)
+        link = f"[{title}]({url})" if url else f"**{title}**"
+        st.markdown(
+            f"{link}\n\n"
+            f"`{source}` | `{date_text}` | `{direction}`  \n"
+            f"{reason}",
+            unsafe_allow_html=False,
+        )
+        st.divider()
+
+
+def render_simple_narrative_cards(summary: pd.DataFrame, details: pd.DataFrame, force_no_search: bool = False) -> None:
+    display_order = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"]
+    rows_by_currency = {safe_text(row.get("currency")).upper(): row for _, row in summary.iterrows()} if not summary.empty else {}
+    for row_start in range(0, len(display_order), 4):
+        cols = st.columns(4)
+        for col, currency in zip(cols, display_order[row_start : row_start + 4]):
+            row = rows_by_currency.get(currency, pd.Series({"currency": currency, "sentiment": "Not enough data"}))
+            sentiment = "Not enough data" if force_no_search else safe_text(row.get("sentiment", "Not enough data"))
+            label = narrative_display_label(sentiment)
+            tone = narrative_tone(sentiment)
+            score = to_float(row.get("weighted_score", 0.0), 0.0)
+            confidence = safe_text(row.get("confidence", "Low"))
+            source_count = int(to_float(row.get("source_count", 0), 0))
+            latest = safe_text(row.get("latest_source_date", "n/a"))
+            drivers = safe_text(row.get("main_drivers", "n/a"))
+            explanation = narrative_card_explanation(row, force_no_search=force_no_search)
+            with col:
                 st.markdown(
                     (
-                        f"{link}\n\n"
-                        f"Source: `{esc(row.get('source_name', 'n/a'))}` | Type: `{esc(row.get('source_type', 'n/a'))}` | Retrieval: `{esc(row.get('retrieval_source', 'n/a'))}` | Date: `{esc(date_text)}`  \n"
-                        f"Detected currencies: `{esc(row.get('detected_currencies', row.get('currency')))} ` | Item currency: `{esc(row.get('currency'))}` | Direction: `{esc(row.get('direction', row.get('sentiment')))} ` | "
-                        f"Confidence: `{esc(row.get('confidence'))}` | Relevance: `{esc(row.get('relevance'))}` | Drivers: `{esc(row.get('driver_tags', 'n/a'))}`  \n"
-                        f"Included: `{esc(row.get('included_in_aggregation', 'n/a'))}` | Content: `{esc(row.get('content_depth', 'n/a'))}`  \n"
-                        f"Exclusion reason: `{esc(row.get('exclusion_reason', 'n/a'))}`  \n"
-                        f"Summary: {esc(shorten(row.get('summary', 'n/a'), 220))}  \n"
-                        f"Reason: {esc(shorten(row.get('reason', 'n/a'), 180))}"
+                        f'<div class="narrative-card tone-{tone}">'
+                        f'<div class="ccy">{currency}</div>'
+                        f'<div class="sentiment">{esc(label)}</div>'
+                        f'<div class="line">Score: <strong>{score:+.2f}</strong></div>'
+                        f'<div class="line">Confidence: {esc(confidence)}</div>'
+                        f'<div class="line">Sources: {source_count} | Latest: {esc(latest)}</div>'
+                        f'<div class="label">Main drivers</div><div class="mini">{esc(shorten(drivers, 90))}</div>'
+                        f'<div class="label">Read</div><div class="mini">{esc(explanation)}</div>'
+                        "</div>"
                     ),
-                    unsafe_allow_html=False,
+                    unsafe_allow_html=True,
                 )
-                st.divider()
+                with st.expander(f"{currency} sources", expanded=False):
+                    message = "No Google search evidence retrieved for this currency." if force_no_search else ""
+                    render_currency_source_items(currency, details, message)
+
+
+def render_narrative_technical_debug(
+    diagnostics: dict,
+    failures: list[dict],
+    all_items: pd.DataFrame,
+    details: pd.DataFrame,
+) -> None:
+    with st.expander("Technical debug", expanded=False):
+        queries = diagnostics.get("queries_used", [])
+        st.markdown("**Queries used**")
+        render_dataframe(pd.DataFrame(queries), height=220) if queries else st.caption("No query rows available.")
+        st.markdown("**Failed sources**")
+        render_dataframe(pd.DataFrame(failures), height=220) if failures else st.caption("No failed source rows.")
+        st.markdown("**Raw rows**")
+        if not all_items.empty:
+            raw_cols = [
+                col
+                for col in [
+                    "currency",
+                    "retrieval_source",
+                    "source_name",
+                    "title",
+                    "published_at",
+                    "detected_currencies",
+                    "direction",
+                    "confidence",
+                    "relevance",
+                    "included_in_aggregation",
+                    "exclusion_reason",
+                    "url",
+                ]
+                if col in all_items.columns
+            ]
+            render_dataframe(all_items[raw_cols], height=260)
+        else:
+            st.caption("No raw rows.")
+        st.markdown("**Classified rows**")
+        if not details.empty:
+            detail_cols = [col for col in details.columns if col != "published_dt"]
+            render_dataframe(details[detail_cols].head(200), height=260)
+        else:
+            st.caption("No classified rows.")
+        st.markdown("**Source registry**")
+        registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
+        show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
+        render_dataframe(registry[show_cols], height=260)
 
 
 def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
@@ -3019,34 +3355,22 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.session_state["narrative_diagnostics"] = {}
 
     google_ready = has_google_cse_credentials()
-    source_cols = st.columns([0.27, 0.27, 0.27, 0.19])
-    with source_cols[0]:
-        use_gdelt = st.checkbox("Use GDELT news search", value=True, help="Free public news metadata/API layer. No article full-text scraping.")
-    with source_cols[1]:
-        use_google = st.checkbox(
-            "Use curated Google CSE",
-            value=google_ready,
-            disabled=not google_ready,
-            help="Uses GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID from Streamlit Secrets or environment variables.",
-        )
-    with source_cols[2]:
-        use_rss = st.checkbox("Use official/public RSS", value=True, help="Uses only simple public feeds from the curated registry.")
-    with source_cols[3]:
+    refresh_cols = st.columns([0.24, 0.76])
+    with refresh_cols[0]:
         refresh_clicked = st.button("Refresh public narratives", use_container_width=True)
-
-    if not google_ready:
-        st.caption("Google CSE credentials are missing in Streamlit Secrets/env, so the app will use GDELT/RSS/CSV fallback.")
-    else:
-        st.caption("Google CSE credentials detected. Search runs only when Refresh is clicked and uses your curated Programmable Search Engine.")
+    with refresh_cols[1]:
+        st.caption(
+            "Refresh currently tests Google CSE only. GDELT and RSS fallback are kept out of the main read so the tab does not imply broad coverage when search is failing."
+        )
 
     if refresh_clicked:
         st.session_state["narrative_refresh_token"] += 1
         with st.spinner("Refreshing public narrative sources..."):
             live_frame, failures, refreshed_at, diagnostics, raw_items = fetch_public_narratives(
                 st.session_state["narrative_refresh_token"],
-                use_gdelt=use_gdelt,
-                use_google=use_google,
-                use_rss=use_rss,
+                use_gdelt=False,
+                use_google=google_ready,
+                use_rss=False,
             )
         st.session_state["narrative_live_frame"] = live_frame
         st.session_state["narrative_failures"] = failures
@@ -3054,41 +3378,31 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.session_state["narrative_diagnostics"] = diagnostics
         st.session_state["narrative_raw_items"] = raw_items
         if live_frame.empty and raw_items.empty:
-            st.warning("Public narrative refresh returned no usable rows. CSV/JSON data or the empty state remains available.")
+            st.warning("Google CSE returned no usable narrative rows. No broad currency narrative is available from this refresh.")
 
     live_narrative = st.session_state.get("narrative_live_frame", pd.DataFrame())
     live_raw_items = st.session_state.get("narrative_raw_items", pd.DataFrame())
-    has_live_narrative = isinstance(live_narrative, pd.DataFrame) and not live_narrative.empty
     has_live_raw = isinstance(live_raw_items, pd.DataFrame) and not live_raw_items.empty
     has_live_attempt = bool(st.session_state.get("narrative_refreshed_at"))
-    narrative = live_narrative if has_live_narrative else csv_narrative
-    data_source = "Live public-source cache" if (has_live_narrative or has_live_raw or has_live_attempt) else "Uploaded/local CSV or JSON"
+    narrative = live_narrative if has_live_attempt else csv_narrative
+    data_source = "Live public-source cache" if has_live_attempt else "Uploaded/local CSV or JSON"
     summary, details = aggregate_public_narratives(narrative, strength)
     if data_source == "Live public-source cache" and has_live_raw:
         all_items = live_raw_items.copy()
     else:
         all_items = normalize_loaded_narrative_items(narrative)
 
-    source_count = int(details["url"].astype(str).nunique()) if not details.empty and "url" in details.columns else 0
-    fresh_count = int(details["age_days"].le(PUBLIC_NARRATIVE_LOOKBACK_DAYS).sum()) if not details.empty and "age_days" in details.columns else 0
-    supports = int(summary["narrative_vs_dashboard"].eq("Supports dashboard").sum()) if not summary.empty else 0
-    conflicts = int(summary["narrative_vs_dashboard"].eq("Conflicts with dashboard").sum()) if not summary.empty else 0
-    render_status_grid(
-        [
-            status_card("Narrative rows", len(details), f"{source_count} unique source links.", "info"),
-            status_card("30-day rows", fresh_count, "Items inside the public narrative window.", "good" if fresh_count else "watch"),
-            status_card("Supports dashboard", supports, "Narrative direction broadly aligns with signal-implied strength.", "good" if supports else "info"),
-            status_card("Conflicts", conflicts, "Narrative direction conflicts with signal-implied strength.", "bad" if conflicts else "info"),
-        ]
-    )
-
-    if st.session_state.get("narrative_refreshed_at"):
-        st.caption(f"Last refreshed: {st.session_state['narrative_refreshed_at']} | Data source: {data_source}")
-    else:
-        st.caption(f"Data source: {data_source}")
-
     diagnostics = st.session_state.get("narrative_diagnostics", {})
     if data_source != "Live public-source cache" or not diagnostics:
+        all_items_source_counts = all_items["retrieval_source"].value_counts().to_dict() if not all_items.empty and "retrieval_source" in all_items.columns else {}
+        all_items_google = int(all_items["retrieval_source"].eq("Google CSE").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
+        all_items_gdelt = int(all_items["retrieval_source"].eq("GDELT").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
+        all_items_rss = int(all_items["retrieval_source"].eq("RSS").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
+        all_items_search = all_items_google + all_items_gdelt
+        all_items_loaded_currencies = currencies_from_frame(all_items)
+        all_items_search_currencies = currencies_from_frame(all_items, {"Google CSE", "GDELT"})
+        all_items_rss_currencies = currencies_from_frame(all_items, {"RSS"})
+        all_items_rss_only_usd = bool(all_items_rss and all_items_search == 0 and all_items_rss_currencies and set(all_items_rss_currencies).issubset({"USD"}))
         diagnostics = {
             "sources_configured": len(PUBLIC_NARRATIVE_SOURCE_REGISTRY),
             "sources_attempted": 0,
@@ -3104,37 +3418,43 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             "items_with_detected_currencies": int(all_items["detected_currencies"].astype(str).str.len().gt(0).sum()) if not all_items.empty and "detected_currencies" in all_items.columns else 0,
             "items_used_in_aggregation": int(to_bool_series(details["included_in_aggregation"]).sum()) if not details.empty and "included_in_aggregation" in details.columns else 0,
             "items_excluded": max(len(details) - int(to_bool_series(details["included_in_aggregation"]).sum()), 0) if not details.empty and "included_in_aggregation" in details.columns else 0,
+            "retrieval_source_counts": all_items_source_counts,
+            "google_cse_items": all_items_google,
+            "gdelt_items": all_items_gdelt,
+            "rss_items": all_items_rss,
+            "public_search_items": all_items_search,
+            "loaded_currency_coverage": ", ".join(all_items_loaded_currencies) if all_items_loaded_currencies else "none",
+            "public_search_currency_coverage": ", ".join(all_items_search_currencies) if all_items_search_currencies else "none",
+            "rss_currency_coverage": ", ".join(all_items_rss_currencies) if all_items_rss_currencies else "none",
+            "rss_only_usd_warning": "RSS fallback only returned USD-related sources." if all_items_rss_only_usd else "",
             "queries_used": [],
         }
-    render_fetch_diagnostics(diagnostics, st.session_state.get("narrative_failures", []))
+    failures = st.session_state.get("narrative_failures", [])
+    render_simple_narrative_status(diagnostics, failures, data_source)
 
-    if details.empty:
-        st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or enable public-source fetching later.")
-        if not all_items.empty:
-            render_narrative_source_expanders(summary, details, all_items)
-        with st.expander("Curated source registry", expanded=True):
-            registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
-            show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
-            render_dataframe(registry[show_cols], height=420)
-        return
+    public_search_items = int(to_float(diagnostics.get("public_search_items", 0), 0))
+    rss_only_usd = bool(diagnostics.get("rss_only_usd_warning"))
+    google_status = safe_text(diagnostics.get("google_cse_status", "missing credentials"))
+    force_no_search = bool((has_live_attempt and public_search_items == 0) or rss_only_usd)
+
+    if has_live_attempt and public_search_items == 0:
+        if google_status and google_status not in ["available", "disabled"]:
+            st.error("Google CSE failed. No broad currency narrative available.")
+        else:
+            st.warning("No Google search evidence retrieved. No broad currency narrative available.")
+    elif rss_only_usd:
+        st.warning("RSS fallback loaded USD-only sources. This is not treated as broad currency narrative coverage.")
+    elif details.empty:
+        st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or click Refresh after Google CSE is configured.")
+
+    display_summary = summary
+    display_details = details
+    if force_no_search:
+        display_summary, display_details = aggregate_public_narratives(pd.DataFrame(), strength)
 
     st.markdown("#### Currency narrative read")
-    render_narrative_cards(summary)
-    render_narrative_source_expanders(summary, details, all_items)
-
-    failures = st.session_state.get("narrative_failures", [])
-    if failures:
-        with st.expander("Failed public sources from last refresh", expanded=False):
-            render_dataframe(pd.DataFrame(failures), height=260)
-
-    with st.expander("Curated source registry", expanded=False):
-        registry = pd.DataFrame(PUBLIC_NARRATIVE_SOURCE_REGISTRY)
-        show_cols = [col for col in ["source_name", "source_type", "coverage", "url", "feed_url", "fetch_enabled", "disabled_reason"] if col in registry.columns]
-        render_dataframe(registry[show_cols], height=420)
-    with st.expander("Technical details: narrative aggregation"):
-        render_dataframe(summary, height=320)
-    with st.expander("Technical details: raw narrative rows"):
-        render_dataframe(details.drop(columns=[col for col in ["published_dt"] if col in details.columns]), height=460)
+    render_simple_narrative_cards(display_summary, display_details, force_no_search=force_no_search)
+    render_narrative_technical_debug(diagnostics, failures, all_items, details)
 
 
 def main() -> None:
