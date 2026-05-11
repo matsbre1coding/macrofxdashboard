@@ -16,7 +16,7 @@ Kurz gesagt: Colab berechnet die Daten und exportiert eine ZIP. Streamlit zeigt 
 - `macro_fx_regime_dashboard_colab_v0_8.ipynb` - Vorversion mit offizieller Source Registry und Bank-of-Canada-Primary-Source-Pilot.
 - `macro_fx_regime_dashboard_colab_v0_7.ipynb` - stabile Vorversion mit Anti-Overfitting-/Out-of-Sample-Block.
 - `macro_fx_regime_dashboard_colab.ipynb` - Basisversion / frueherer Stand.
-- `streamlit_app.py` - interaktive Streamlit-App v1.9.1 Public Narrative Diagnostics, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
+- `streamlit_app.py` - interaktive Streamlit-App v2.0 Brave Narrative Monitor, die die CSV-Exports aus Colab als professionelles Macro-FX-Cockpit liest.
 - `UX_BLUEPRINT_v1_3.md` - Produktstruktur und UX-Blueprint fuer das finale Dashboard.
 - `requirements.txt` - minimale Python-Abhaengigkeiten fuer die Streamlit-App.
 
@@ -40,21 +40,22 @@ streamlit run streamlit_app.py
 - `Currencies`: relative Waehrungsstaerke plus Datenstatus pro Waehrung.
 - `Pairs`: Watchlist, Kontext- und blockierte Pair-Ideen mit OOS- und CPI/Rates-Historie.
 - `Regime`: Scorecard als primaerer US/USD-led FX Backdrop, Markov/Bayes als Warn- und Confidence-Layer.
-- `Narrative Monitor`: optionaler Public-Narrative-Layer mit 8 einfachen Waehrungskarten, Google-CSE-Teststatus und technischem Debug nur in einem geschlossenen Expander. Dieser Tab ist kein Bank Consensus, kein Trading Signal und veraendert keine Dashboard-Scores.
+- `Narrative Monitor`: optionaler Public-Narrative-Layer mit 8 einfachen Waehrungskarten, Brave-Search-Smoke-Test und technischem Debug nur in einem geschlossenen Expander. Dieser Tab ist kein Bank Consensus, kein Trading Signal und veraendert keine Dashboard-Scores.
 - `Data Quality`: Freshness, API-/Source-Luecken und warum Signale downgraded werden.
 
 ## Optionaler Narrative Monitor
 
-Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden. Der Refresh-Button testet in der vereinfachten Version primaer die kuratierte Google Programmable Search Engine, damit fehlgeschlagene Google-CSE-Setups nicht durch USD-only RSS-Fallback verdeckt werden.
+Der `Narrative Monitor` ist ein zusaetzlicher Research-Layer. Er kann optional eine Datei namens `narrative_monitor.csv`, `macro_fx_public_narrative_monitor.csv` oder die entsprechende `.json`-Variante laden. Der Refresh-Button nutzt primaer die Brave Search API als breite Public-Narrative-Quelle. Google CSE bleibt nur noch als Legacy-Provider im Debug sichtbar und ist nicht mehr die Hauptquelle.
 
-Fuer Google Custom Search werden Secrets/Environment Variables genutzt, niemals hardcoded:
+Fuer Brave Search werden Secrets/Environment Variables genutzt, niemals hardcoded:
 
 ```toml
-GOOGLE_SEARCH_API_KEY = "..."
-GOOGLE_SEARCH_ENGINE_ID = "..."
+BRAVE_SEARCH_API_KEY = "..."
 ```
 
-Google Search wird nur durch den Button `Refresh public narratives` im Tab gestartet, nicht automatisch beim App-Start. Der Tab zeigt oben nur Data-Source-Status, Google-Status, Last Refresh und Items Used. Fehler aus der Google Custom Search JSON API werden mit HTTP-Code, Google-Status, Message und Reason angezeigt, zum Beispiel `keyInvalid`, `accessNotConfigured`, `quotaExceeded`, `invalid cx / request argument` oder `referer/IP restriction`.
+Brave Search wird nur durch den Button `Refresh public narratives` im Tab gestartet, nicht automatisch beim App-Start. Der Tab zeigt oben nur Data-Source-Status, Brave-Status, Last Refresh und Items Used. Vor dem eigentlichen Abruf laeuft ein Smoke Test mit `EUR forex outlook`; im technischen Debug stehen Result Count und die ersten Titel. Wenn kein Key vorhanden ist, zeigt die App klar: `No broad search provider configured. Add BRAVE_SEARCH_API_KEY.`
+
+Fehler aus der Brave Search API werden mit HTTP-Code, Provider-Status, Message und Reason angezeigt. Wenn Brave fehlschlaegt, werden keine USD-only RSS-Quellen als breite Waehrungsabdeckung verkauft.
 
 GDELT bleibt standardmaessig aus. Der Code bricht bei HTTP 429 sauber mit `rate limited` ab, statt eine Fehlerseite als JSON zu parsen.
 
@@ -308,6 +309,16 @@ v1.9.2 vereinfacht den Public Narrative Monitor wieder zu einem stabilen Evidenc
 - technische Details nur noch in einem geschlossenen `Technical debug` Expander
 - gewichteter Public Narrative Read pro Waehrung, nur wenn brauchbare Suchdaten vorliegen
 - Vergleich `Narrative vs Dashboard`, ohne bestehende Macro-/Pair-/Data-Quality-Logik zu veraendern
+
+v2.0 stellt den Public Narrative Monitor auf Brave Search als primaeren Provider um:
+
+- `BRAVE_SEARCH_API_KEY` wird aus Streamlit Secrets oder Environment Variables gelesen
+- Google CSE ist nur noch Legacy-Debug, weil Custom Search JSON API im aktuellen Projekt nicht freigeschaltet ist
+- Smoke Test `EUR forex outlook` vor dem eigentlichen Abruf
+- maximal 2 Queries pro Waehrung und maximal wenige relevante Treffer pro Query
+- kein Auto-Refresh beim App-Start; Abruf nur ueber `Refresh public narratives`
+- falls Brave fehlt oder fehlschlaegt, zeigt der Tab klar, dass keine breite Public-Narrative-Abdeckung vorhanden ist
+- GDELT/RSS bleiben aus dem Haupt-Refresh heraus, damit keine USD-only Fallbacks als globale Abdeckung wirken
 
 ## Naechste sinnvolle Schritte
 

@@ -21,7 +21,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "v1.9.2 Simplified Narrative Monitor"
+APP_VERSION = "v2.0 Brave Narrative Monitor"
 
 
 st.set_page_config(
@@ -85,6 +85,7 @@ NARRATIVE_COLUMNS = [
 
 
 FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"}
+PUBLIC_SEARCH_RETRIEVAL_SOURCES = {"Brave Search", "Google CSE", "GDELT"}
 
 
 CURRENCY_DETECTION_TERMS = {
@@ -106,6 +107,9 @@ PUBLIC_NARRATIVE_LOOKBACK_DAYS = 30
 PUBLIC_NARRATIVE_CACHE_TTL_SECONDS = 21600
 GOOGLE_CSE_RESULTS_PER_QUERY = 5
 GOOGLE_CSE_MAX_RESULTS_PER_REFRESH = 120
+BRAVE_SEARCH_RESULTS_PER_QUERY = 6
+BRAVE_SEARCH_MAX_RESULTS_PER_REFRESH = 120
+PUBLIC_NARRATIVE_MAX_ITEMS_PER_CURRENCY = 8
 GDELT_MAX_QUERIES_PER_REFRESH = 8
 GDELT_REQUEST_PAUSE_SECONDS = 0.75
 
@@ -368,7 +372,7 @@ for _source in PUBLIC_NARRATIVE_SOURCE_REGISTRY:
     if _source.get("fetch_enabled"):
         _source.setdefault("disabled_reason", "")
     else:
-        _source.setdefault("disabled_reason", "No stable public RSS/API endpoint configured; use Google CSE/GDELT instead of aggressive scraping.")
+        _source.setdefault("disabled_reason", "No stable public RSS/API endpoint configured; use Brave Search or CSV input instead of aggressive scraping.")
 
 
 def inject_css() -> None:
@@ -1482,6 +1486,10 @@ def has_google_cse_credentials() -> bool:
     return bool(read_secret_or_env("GOOGLE_SEARCH_API_KEY") and read_secret_or_env("GOOGLE_SEARCH_ENGINE_ID"))
 
 
+def has_brave_search_credentials() -> bool:
+    return bool(read_secret_or_env("BRAVE_SEARCH_API_KEY"))
+
+
 def source_domain(url: object) -> str:
     parsed = urllib.parse.urlparse(safe_text(url, ""))
     domain = parsed.netloc or safe_text(url, "")
@@ -1503,6 +1511,10 @@ def parse_http_error_details(exc: urllib.error.HTTPError) -> dict:
         "google_error_message": "",
         "google_error_status": "",
         "google_error_reason": "",
+        "provider_error_code": "",
+        "provider_error_message": "",
+        "provider_error_status": "",
+        "provider_error_reason": "",
     }
     if body:
         try:
@@ -1523,10 +1535,33 @@ def parse_http_error_details(exc: urllib.error.HTTPError) -> dict:
                     "google_error_message": safe_text(google_error.get("message", "")),
                     "google_error_status": safe_text(google_error.get("status", "")),
                     "google_error_reason": ", ".join(dict.fromkeys(reasons)),
+                    "provider_error_code": safe_text(google_error.get("code", "")),
+                    "provider_error_message": safe_text(google_error.get("message", "")),
+                    "provider_error_status": safe_text(google_error.get("status", "")),
+                    "provider_error_reason": ", ".join(dict.fromkeys(reasons)),
                 }
             )
             if details["google_error_message"]:
                 details["error"] = shorten(details["google_error_message"], 220)
+        elif isinstance(payload, dict):
+            provider_message = safe_text(
+                payload.get("message")
+                or payload.get("detail")
+                or payload.get("error_description")
+                or payload.get("error", "")
+            )
+            provider_code = safe_text(payload.get("code") or payload.get("type") or payload.get("status") or "")
+            provider_reason = safe_text(payload.get("reason") or payload.get("title") or "")
+            details.update(
+                {
+                    "provider_error_code": provider_code,
+                    "provider_error_message": provider_message,
+                    "provider_error_status": safe_text(payload.get("status", "")),
+                    "provider_error_reason": provider_reason,
+                }
+            )
+            if provider_message:
+                details["error"] = shorten(provider_message, 220)
     return details
 
 
@@ -1784,6 +1819,18 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         axis=1,
     )
     details["exclusion_reason"] = details.apply(narrative_exclusion_reason, axis=1)
+    details["_included_sort"] = to_bool_series(details["included_in_aggregation"]).astype(int)
+    details["_abs_weight_sort"] = pd.to_numeric(details["weighted_source_score"], errors="coerce").abs().fillna(0.0)
+    details = (
+        details.sort_values(
+            ["currency", "_included_sort", "published_dt", "_abs_weight_sort"],
+            ascending=[True, False, False, False],
+            na_position="last",
+        )
+        .groupby("currency", group_keys=False)
+        .head(PUBLIC_NARRATIVE_MAX_ITEMS_PER_CURRENCY)
+        .drop(columns=["_included_sort", "_abs_weight_sort"])
+    )
 
     strength_map = {}
     if not strength.empty and {"currency", "strength"}.issubset(strength.columns):
@@ -1792,7 +1839,7 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
     has_global_rss_rows = False
     global_rss_currencies: list[str] = []
     if "retrieval_source" in details.columns:
-        has_global_search_rows = bool(details["retrieval_source"].isin(["Google CSE", "GDELT"]).any())
+        has_global_search_rows = bool(details["retrieval_source"].isin(PUBLIC_SEARCH_RETRIEVAL_SOURCES).any())
         has_global_rss_rows = bool(details["retrieval_source"].eq("RSS").any())
         global_rss_currencies = currencies_from_frame(details, {"RSS"})
     global_rss_only_usd = bool(has_global_rss_rows and not has_global_search_rows and global_rss_currencies and set(global_rss_currencies).issubset({"USD"}))
@@ -1804,7 +1851,7 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         used_rows = rows[to_bool_series(rows["included_in_aggregation"])] if not rows.empty else rows
         working = used_rows if not used_rows.empty else (fresh_rows if not fresh_rows.empty else rows)
         retrieval_sources = sorted(rows["retrieval_source"].dropna().astype(str).unique().tolist()) if not rows.empty and "retrieval_source" in rows.columns else []
-        search_rows = rows[rows["retrieval_source"].isin(["Google CSE", "GDELT"])] if not rows.empty and "retrieval_source" in rows.columns else rows.iloc[0:0]
+        search_rows = rows[rows["retrieval_source"].isin(PUBLIC_SEARCH_RETRIEVAL_SOURCES)] if not rows.empty and "retrieval_source" in rows.columns else rows.iloc[0:0]
         rss_rows = rows[rows["retrieval_source"].eq("RSS")] if not rows.empty and "retrieval_source" in rows.columns else rows.iloc[0:0]
         source_count = int(len(rows))
         fresh_count = int(len(fresh_rows))
@@ -1885,9 +1932,9 @@ def aggregate_public_narratives(narrative: pd.DataFrame, strength: pd.DataFrame)
         elif search_source_count == 0 and rss_source_count > 0 and currency == "USD":
             coverage_note = "Only USD RSS fallback sources loaded."
         elif search_source_count == 0 and rss_source_count > 0:
-            coverage_note = "Only RSS fallback sources loaded; no Google/GDELT evidence for this currency."
+            coverage_note = "Only RSS fallback sources loaded; no broad search evidence for this currency."
         elif search_source_count == 0:
-            coverage_note = "No Google/GDELT evidence retrieved for this currency."
+            coverage_note = "No broad search evidence retrieved for this currency."
         else:
             coverage_note = "Public search evidence available."
 
@@ -2165,11 +2212,47 @@ def extract_google_item_date(item: dict) -> str:
     return pd.Timestamp.now(tz="UTC").isoformat()
 
 
-def fetch_json(url: str, timeout: int = 10) -> dict:
-    request = urllib.request.Request(url, headers={"User-Agent": "MacroFXCockpitPublicNarrativeMonitor/1.0"})
+def extract_brave_item_date(item: dict) -> str:
+    for key in ["page_age", "age", "published", "published_at", "date"]:
+        value = safe_text(item.get(key, ""), "")
+        if not value:
+            continue
+        parsed = pd.to_datetime(value, errors="coerce", utc=True)
+        if not pd.isna(parsed):
+            return parsed.isoformat()
+        lowered = value.lower()
+        match = re.search(r"(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago", lowered)
+        if match:
+            number = int(match.group(1))
+            unit = match.group(2)
+            now = pd.Timestamp.now(tz="UTC")
+            if unit == "minute":
+                return (now - pd.Timedelta(minutes=number)).isoformat()
+            if unit == "hour":
+                return (now - pd.Timedelta(hours=number)).isoformat()
+            if unit == "day":
+                return (now - pd.Timedelta(days=number)).isoformat()
+            if unit == "week":
+                return (now - pd.Timedelta(days=number * 7)).isoformat()
+            if unit == "month":
+                return (now - pd.Timedelta(days=number * 30)).isoformat()
+            if unit == "year":
+                return (now - pd.Timedelta(days=number * 365)).isoformat()
+    return pd.Timestamp.now(tz="UTC").isoformat()
+
+
+def fetch_json_with_headers(url: str, headers: dict | None = None, timeout: int = 10) -> dict:
+    request_headers = {"User-Agent": "MacroFXCockpitPublicNarrativeMonitor/1.0"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = response.read().decode("utf-8", errors="replace")
     return json.loads(payload)
+
+
+def fetch_json(url: str, timeout: int = 10) -> dict:
+    return fetch_json_with_headers(url, timeout=timeout)
 
 
 def fetch_feed_items(source: dict, per_source_limit: int = 6) -> tuple[list[dict], list[dict]]:
@@ -2237,6 +2320,162 @@ def fetch_feed_items(source: dict, per_source_limit: int = 6) -> tuple[list[dict
         )
         classified_rows.extend(classify_public_item({**source, "retrieval_source": "RSS", "content_depth": "snippet_only"}, title, summary, published_at, url))
     return raw_rows, classified_rows
+
+
+def brave_status_from_error(details: dict) -> str:
+    http_status = safe_text(details.get("http_status", ""))
+    message = safe_text(details.get("provider_error_message", details.get("error", ""))).lower()
+    reason = safe_text(details.get("provider_error_reason", "")).lower()
+    if http_status in ["401"] or "unauthorized" in message or "invalid api key" in message:
+        return "invalid API key"
+    if http_status in ["403"] or "forbidden" in message or "permission" in message:
+        return "permission denied"
+    if http_status in ["429"] or "rate limit" in message or "quota" in message:
+        return "quota/rate limited"
+    if http_status in ["400"] or "bad request" in message or "invalid" in reason:
+        return "bad request"
+    if http_status:
+        return f"http {http_status} failed"
+    return "failed"
+
+
+def fetch_brave_search_items(api_key: str) -> tuple[list[dict], list[dict], list[dict], list[dict], str]:
+    raw_rows: list[dict] = []
+    classified_rows: list[dict] = []
+    failures: list[dict] = []
+    query_rows: list[dict] = []
+    total_results = 0
+    status = "not tested"
+    brave_abort = False
+
+    def run_brave_query(currency: str, query: str, smoke_test: bool = False) -> bool:
+        nonlocal total_results, status, brave_abort
+        if total_results >= BRAVE_SEARCH_MAX_RESULTS_PER_REFRESH or brave_abort:
+            return False
+        params = {
+            "q": query,
+            "count": BRAVE_SEARCH_RESULTS_PER_QUERY,
+            "freshness": "pm",
+            "text_decorations": "false",
+        }
+        url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params)
+        query_status = "attempted"
+        query_result_count = 0
+        sample_titles: list[str] = []
+        try:
+            payload = fetch_json_with_headers(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": api_key,
+                },
+                timeout=10,
+            )
+            items = payload.get("web", {}).get("results", []) if isinstance(payload, dict) else []
+            query_result_count = len(items)
+            query_status = f"{query_result_count} result(s)"
+            status = "available" if query_result_count else "available / no results"
+            for item in items[:BRAVE_SEARCH_RESULTS_PER_QUERY]:
+                result_url = safe_text(item.get("url", ""))
+                title = clean_feed_text(item.get("title", ""))
+                summary = clean_feed_text(item.get("description", "") or item.get("snippet", ""))
+                published_at = extract_brave_item_date(item)
+                source_name = source_domain(result_url)
+                sample_titles.append(title)
+                source = {
+                    "source_name": source_name,
+                    "source_type": "Established financial media/search result",
+                    "coverage": currency,
+                    "retrieval_source": "Brave Search",
+                    "content_depth": "public_page_snippet",
+                }
+                detection_text = f"{title} {summary} {currency}"
+                raw_rows.append(
+                    {
+                        "currency": currency,
+                        "detected_currencies": detected_currency_string(detection_text, currency),
+                        "source_name": source_name,
+                        "source_type": source["source_type"],
+                        "title": title,
+                        "url": result_url,
+                        "published_at": published_at,
+                        "snippet_or_summary": shorten(summary, 320),
+                        "summary": shorten(summary, 320),
+                        "driver_tags": ", ".join(extract_driver_tags(detection_text)),
+                        "direction": "Neutral",
+                        "sentiment": "Neutral",
+                        "confidence": "Low",
+                        "relevance": classify_relevance(source["source_type"], detection_text, True),
+                        "horizon": classify_horizon(detection_text),
+                        "evidence_strength": "Weak",
+                        "themes": "public commentary",
+                        "supports": "",
+                        "risks": "",
+                        "reason": "Brave Search result snippet; no article full text fetched.",
+                        "retrieval_source": "Brave Search",
+                        "content_depth": "public_page_snippet",
+                    }
+                )
+                classified_rows.extend(classify_public_item(source, title, summary, published_at, result_url))
+            total_results += query_result_count
+        except urllib.error.HTTPError as exc:
+            error_details = parse_http_error_details(exc)
+            status = brave_status_from_error(error_details)
+            query_status = status
+            brave_abort = True
+            failures.append(
+                {
+                    "source_name": "Brave Search API",
+                    "source_type": "Search API",
+                    "url": "https://api.search.brave.com/res/v1/web/search",
+                    "currency": currency,
+                    "query": query,
+                    "diagnostic_status": status,
+                    **error_details,
+                }
+            )
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            status = "failed"
+            query_status = "failed"
+            brave_abort = True
+            failures.append(
+                {
+                    "source_name": "Brave Search API",
+                    "source_type": "Search API",
+                    "url": "https://api.search.brave.com/res/v1/web/search",
+                    "currency": currency,
+                    "query": query,
+                    "diagnostic_status": status,
+                    "error": shorten(str(exc), 220),
+                }
+            )
+        query_rows.append(
+            {
+                "retrieval_source": "Brave Search",
+                "currency": currency,
+                "query": query,
+                "status": query_status,
+                "result_count": query_result_count,
+                "sample_titles": " | ".join(sample_titles[:3]),
+                "smoke_test": bool(smoke_test),
+            }
+        )
+        return query_result_count > 0 and not brave_abort
+
+    smoke_ok = run_brave_query("EUR", "EUR forex outlook", smoke_test=True)
+    if not smoke_ok:
+        return raw_rows, classified_rows, failures, query_rows, status
+
+    for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
+        if brave_abort:
+            break
+        for query in queries[:2]:
+            if total_results >= BRAVE_SEARCH_MAX_RESULTS_PER_REFRESH or brave_abort:
+                break
+            run_brave_query(currency, query)
+        if total_results >= BRAVE_SEARCH_MAX_RESULTS_PER_REFRESH or brave_abort:
+            break
+    return raw_rows, classified_rows, failures, query_rows, status
 
 
 def fetch_google_cse_items(api_key: str, engine_id: str) -> tuple[list[dict], list[dict], list[dict], list[dict], str]:
@@ -2357,7 +2596,7 @@ def fetch_google_cse_items(api_key: str, engine_id: str) -> tuple[list[dict], li
     for currency, queries in PUBLIC_NARRATIVE_QUERIES.items():
         if google_abort:
             break
-        for query in queries[:3]:
+        for query in queries[:2]:
             if total_results >= GOOGLE_CSE_MAX_RESULTS_PER_REFRESH or google_abort:
                 break
             run_google_query(currency, query)
@@ -2446,7 +2685,7 @@ def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]
                 if getattr(exc, "code", None) == 429:
                     query_status = "rate limited"
                     rate_limited = True
-                    error_details["error"] = "GDELT rate limited the request. Refresh later or leave GDELT disabled while testing Google CSE."
+                    error_details["error"] = "GDELT rate limited the request. Refresh later or leave GDELT disabled while testing Brave Search."
                     error_details["diagnostic_status"] = "rate limited"
                 else:
                     query_status = f"http {getattr(exc, 'code', '')} failed"
@@ -2495,7 +2734,13 @@ def fetch_gdelt_items() -> tuple[list[dict], list[dict], list[dict], list[dict]]
 
 
 @st.cache_data(ttl=PUBLIC_NARRATIVE_CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: bool, use_rss: bool) -> tuple[pd.DataFrame, list[dict], str, dict, pd.DataFrame]:
+def fetch_public_narratives(
+    refresh_token: int,
+    use_gdelt: bool,
+    use_google: bool,
+    use_rss: bool,
+    use_brave: bool = False,
+) -> tuple[pd.DataFrame, list[dict], str, dict, pd.DataFrame]:
     rows: list[dict] = []
     raw_rows: list[dict] = []
     failures: list[dict] = []
@@ -2503,7 +2748,31 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
     attempted = 0
     successful = 0
     retrieval_modes: list[str] = []
+    brave_status = "disabled"
     google_status = "disabled"
+
+    brave_api_key = read_secret_or_env("BRAVE_SEARCH_API_KEY")
+    if use_brave:
+        retrieval_modes.append("Brave Search")
+        if not brave_api_key:
+            brave_status = "missing credentials"
+            failures.append(
+                {
+                    "source_name": "Brave Search API",
+                    "source_type": "Search API",
+                    "url": "https://api.search.brave.com/res/v1/web/search",
+                    "diagnostic_status": brave_status,
+                    "error": "No broad search provider configured. Add BRAVE_SEARCH_API_KEY.",
+                }
+            )
+        else:
+            attempted += 1
+            brave_raw, brave_rows, brave_failures, brave_queries, brave_status = fetch_brave_search_items(brave_api_key)
+            raw_rows.extend(brave_raw)
+            rows.extend(brave_rows)
+            failures.extend(brave_failures)
+            query_rows.extend(brave_queries)
+            successful += 1 if brave_raw or brave_rows else 0
 
     if use_rss:
         retrieval_modes.append("RSS")
@@ -2539,7 +2808,7 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
     api_key = read_secret_or_env("GOOGLE_SEARCH_API_KEY")
     engine_id = read_secret_or_env("GOOGLE_SEARCH_ENGINE_ID")
     if use_google:
-        retrieval_modes.append("Curated Google CSE")
+        retrieval_modes.append("Legacy Google CSE")
         if not api_key or not engine_id:
             google_status = "missing credentials"
         else:
@@ -2559,18 +2828,22 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
     normalized_raw_count = len(normalized_raw)
     details_used = int(to_bool_series(normalized_details["included_in_aggregation"]).sum()) if not normalized_details.empty and "included_in_aggregation" in normalized_details.columns else 0
     retrieval_source_counts = normalized_raw["retrieval_source"].value_counts().to_dict() if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else {}
-    search_items = int(normalized_raw["retrieval_source"].isin(["Google CSE", "GDELT"]).sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    search_items = int(normalized_raw["retrieval_source"].isin(PUBLIC_SEARCH_RETRIEVAL_SOURCES).sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
+    brave_items = int(normalized_raw["retrieval_source"].eq("Brave Search").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
     google_items = int(normalized_raw["retrieval_source"].eq("Google CSE").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
     gdelt_items = int(normalized_raw["retrieval_source"].eq("GDELT").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
     rss_items = int(normalized_raw["retrieval_source"].eq("RSS").sum()) if not normalized_raw.empty and "retrieval_source" in normalized_raw.columns else 0
     loaded_currencies = currencies_from_frame(normalized_raw)
-    search_currencies = currencies_from_frame(normalized_raw, {"Google CSE", "GDELT"})
+    search_currencies = currencies_from_frame(normalized_raw, PUBLIC_SEARCH_RETRIEVAL_SOURCES)
     rss_currencies = currencies_from_frame(normalized_raw, {"RSS"})
     rss_only_usd = bool(rss_items and search_items == 0 and rss_currencies and set(rss_currencies).issubset({"USD"}))
     coverage_note = "RSS fallback only returned USD-related sources." if rss_only_usd else ""
     diagnostics = {
         "retrieval_mode": " + ".join(retrieval_modes) if retrieval_modes else "CSV/cache only",
+        "brave_search_status": brave_status,
+        "brave_search_credentials": "yes" if bool(brave_api_key) else "no",
         "google_cse_status": google_status,
+        "google_cse_legacy_status": "configured" if api_key and engine_id else "missing credentials",
         "last_refresh": refreshed_at,
         "sources_configured": len(PUBLIC_NARRATIVE_SOURCE_REGISTRY),
         "sources_attempted": attempted,
@@ -2584,6 +2857,7 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
         "items_used_in_aggregation": details_used,
         "items_excluded": max(len(normalized_details) - details_used, 0),
         "retrieval_source_counts": retrieval_source_counts,
+        "brave_search_items": brave_items,
         "google_cse_items": google_items,
         "gdelt_items": gdelt_items,
         "rss_items": rss_items,
@@ -2593,7 +2867,7 @@ def fetch_public_narratives(refresh_token: int, use_gdelt: bool, use_google: boo
         "rss_currency_coverage": ", ".join(rss_currencies) if rss_currencies else "none",
         "rss_only_usd_warning": coverage_note,
         "queries_used": query_rows,
-        "configured_curated_domains": "Managed in Google Programmable Search Engine; RSS registry shown below.",
+        "configured_curated_domains": "Brave Search is the primary provider; RSS registry shown below for optional fallback context.",
     }
     return classified_frame, failures, refreshed_at, diagnostics, normalized_raw
 
@@ -3139,6 +3413,49 @@ def google_failure_summary(failures: list[dict]) -> dict:
     }
 
 
+def brave_failure_summary(failures: list[dict]) -> dict:
+    brave_failures = [
+        failure
+        for failure in failures
+        if "brave" in safe_text(failure.get("source_name", "")).lower()
+        or "api.search.brave.com" in safe_text(failure.get("url", "")).lower()
+    ]
+    if not brave_failures:
+        return {}
+    failure = brave_failures[0]
+    message = safe_text(
+        failure.get("provider_error_message")
+        or failure.get("error")
+        or "Brave Search failed."
+    )
+    return {
+        "status": safe_text(failure.get("diagnostic_status", "failed")),
+        "code": safe_text(failure.get("provider_error_code", "")),
+        "message": message,
+        "provider_status": safe_text(failure.get("provider_error_status", "")),
+        "reason": safe_text(failure.get("provider_error_reason", "")),
+        "query": safe_text(failure.get("query", "")),
+    }
+
+
+def brave_test_summary(diagnostics: dict, failures: list[dict]) -> dict:
+    queries = diagnostics.get("queries_used", [])
+    test_row = {}
+    if isinstance(queries, list):
+        test_rows = [row for row in queries if bool(row.get("smoke_test"))] if queries else []
+        brave_rows = [row for row in queries if row.get("retrieval_source") == "Brave Search"] if queries else []
+        test_row = (test_rows or brave_rows or [{}])[0]
+    failure = brave_failure_summary(failures)
+    return {
+        "credentials": "yes" if has_brave_search_credentials() else "no",
+        "query": safe_text(test_row.get("query", "EUR forex outlook")),
+        "result_count": int(to_float(test_row.get("result_count", 0), 0)),
+        "status": safe_text(test_row.get("status") or diagnostics.get("brave_search_status", "n/a")),
+        "sample_titles": safe_text(test_row.get("sample_titles", "")),
+        "error": failure,
+    }
+
+
 def google_test_summary(diagnostics: dict, failures: list[dict]) -> dict:
     queries = diagnostics.get("queries_used", [])
     test_row = {}
@@ -3157,12 +3474,17 @@ def google_test_summary(diagnostics: dict, failures: list[dict]) -> dict:
 
 
 def render_simple_narrative_status(diagnostics: dict, failures: list[dict], data_source: str) -> None:
-    google_status = safe_text(diagnostics.get("google_cse_status", "missing credentials"))
+    brave_status = safe_text(diagnostics.get("brave_search_status", "missing credentials"))
+    legacy_google = safe_text(diagnostics.get("google_cse_legacy_status", diagnostics.get("google_cse_status", "missing credentials")))
     public_search_items = int(to_float(diagnostics.get("public_search_items", 0), 0))
+    brave_items = int(to_float(diagnostics.get("brave_search_items", 0), 0))
     items_used = int(to_float(diagnostics.get("items_used_in_aggregation", 0), 0))
-    if public_search_items > 0:
-        source_status = "Google search evidence loaded"
+    if brave_items > 0:
+        source_status = "Brave search evidence loaded"
         source_tone = "good"
+    elif public_search_items > 0:
+        source_status = "Broad search evidence loaded"
+        source_tone = "info"
     elif diagnostics.get("rss_only_usd_warning"):
         source_status = "RSS fallback loaded USD-only sources"
         source_tone = "watch"
@@ -3176,17 +3498,20 @@ def render_simple_narrative_status(diagnostics: dict, failures: list[dict], data
     render_status_grid(
         [
             status_card("Data source status", source_status, "Narrative does not change dashboard signals.", source_tone),
-            status_card("Google status", google_status, "CSE is the primary broad-source layer.", "good" if google_status == "available" and public_search_items else "watch"),
+            status_card("Brave status", brave_status, "Primary broad-source search layer.", "good" if brave_status == "available" and brave_items else "watch"),
             status_card("Last refresh", diagnostics.get("last_refresh", "n/a"), "Refresh runs only when clicked.", "info"),
             status_card("Items used", items_used, "Rows that pass freshness/relevance checks.", "good" if items_used else "watch"),
         ]
     )
 
-    test = google_test_summary(diagnostics, failures)
+    test = brave_test_summary(diagnostics, failures)
     st.caption(
-        f"Google credentials detected: {test['credentials']} | Test query: {test['query']} | "
-        f"Result count: {test['result_count']} | Query status: {test['status']}"
+        f"Brave credentials detected: {test['credentials']} | Smoke query: {test['query']} | "
+        f"Result count: {test['result_count']} | Query status: {test['status']} | "
+        f"Legacy Google CSE: {legacy_google}"
     )
+    if test.get("sample_titles"):
+        st.caption(f"Smoke-test sample titles: {shorten(test['sample_titles'], 220)}")
     if test["error"]:
         error = test["error"]
         detail = " | ".join(
@@ -3194,18 +3519,18 @@ def render_simple_narrative_status(diagnostics: dict, failures: list[dict], data
             for part in [
                 f"status={error.get('status')}",
                 f"code={error.get('code')}" if error.get("code") else "",
-                f"google_status={error.get('google_status')}" if error.get("google_status") else "",
+                f"provider_status={error.get('provider_status')}" if error.get("provider_status") else "",
                 f"reason={error.get('reason')}" if error.get("reason") else "",
                 f"message={error.get('message')}" if error.get("message") else "",
             ]
             if part
         )
-        st.warning(f"Google CSE failed. {detail}")
+        st.warning(f"Brave Search failed. {detail}")
 
 
 def narrative_card_explanation(row: pd.Series, force_no_search: bool = False) -> str:
     if force_no_search:
-        return "No Google search evidence retrieved."
+        return "No Brave search evidence retrieved."
     coverage = safe_text(row.get("coverage_note", ""))
     if "Only USD RSS" in coverage:
         return "Only USD RSS fallback sources loaded."
@@ -3278,7 +3603,7 @@ def render_simple_narrative_cards(summary: pd.DataFrame, details: pd.DataFrame, 
                     unsafe_allow_html=True,
                 )
                 with st.expander(f"{currency} sources", expanded=False):
-                    message = "No Google search evidence retrieved for this currency." if force_no_search else ""
+                    message = "No Brave search evidence retrieved for this currency." if force_no_search else ""
                     render_currency_source_items(currency, details, message)
 
 
@@ -3354,13 +3679,13 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
     if "narrative_diagnostics" not in st.session_state:
         st.session_state["narrative_diagnostics"] = {}
 
-    google_ready = has_google_cse_credentials()
+    brave_ready = has_brave_search_credentials()
     refresh_cols = st.columns([0.24, 0.76])
     with refresh_cols[0]:
         refresh_clicked = st.button("Refresh public narratives", use_container_width=True)
     with refresh_cols[1]:
         st.caption(
-            "Refresh currently tests Google CSE only. GDELT and RSS fallback are kept out of the main read so the tab does not imply broad coverage when search is failing."
+            "Refresh tests Brave Search first. Google CSE is legacy-only; GDELT and RSS fallback stay out of the main read."
         )
 
     if refresh_clicked:
@@ -3369,8 +3694,9 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             live_frame, failures, refreshed_at, diagnostics, raw_items = fetch_public_narratives(
                 st.session_state["narrative_refresh_token"],
                 use_gdelt=False,
-                use_google=google_ready,
+                use_google=False,
                 use_rss=False,
+                use_brave=True,
             )
         st.session_state["narrative_live_frame"] = live_frame
         st.session_state["narrative_failures"] = failures
@@ -3378,7 +3704,10 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
         st.session_state["narrative_diagnostics"] = diagnostics
         st.session_state["narrative_raw_items"] = raw_items
         if live_frame.empty and raw_items.empty:
-            st.warning("Google CSE returned no usable narrative rows. No broad currency narrative is available from this refresh.")
+            if not brave_ready:
+                st.warning("No broad search provider configured. Add BRAVE_SEARCH_API_KEY.")
+            else:
+                st.warning("Brave Search returned no usable narrative rows. No broad currency narrative is available from this refresh.")
 
     live_narrative = st.session_state.get("narrative_live_frame", pd.DataFrame())
     live_raw_items = st.session_state.get("narrative_raw_items", pd.DataFrame())
@@ -3395,12 +3724,13 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
     diagnostics = st.session_state.get("narrative_diagnostics", {})
     if data_source != "Live public-source cache" or not diagnostics:
         all_items_source_counts = all_items["retrieval_source"].value_counts().to_dict() if not all_items.empty and "retrieval_source" in all_items.columns else {}
+        all_items_brave = int(all_items["retrieval_source"].eq("Brave Search").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
         all_items_google = int(all_items["retrieval_source"].eq("Google CSE").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
         all_items_gdelt = int(all_items["retrieval_source"].eq("GDELT").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
         all_items_rss = int(all_items["retrieval_source"].eq("RSS").sum()) if not all_items.empty and "retrieval_source" in all_items.columns else 0
-        all_items_search = all_items_google + all_items_gdelt
+        all_items_search = all_items_brave + all_items_google + all_items_gdelt
         all_items_loaded_currencies = currencies_from_frame(all_items)
-        all_items_search_currencies = currencies_from_frame(all_items, {"Google CSE", "GDELT"})
+        all_items_search_currencies = currencies_from_frame(all_items, PUBLIC_SEARCH_RETRIEVAL_SOURCES)
         all_items_rss_currencies = currencies_from_frame(all_items, {"RSS"})
         all_items_rss_only_usd = bool(all_items_rss and all_items_search == 0 and all_items_rss_currencies and set(all_items_rss_currencies).issubset({"USD"}))
         diagnostics = {
@@ -3409,7 +3739,10 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             "sources_successful": 0,
             "sources_failed": len(st.session_state.get("narrative_failures", [])),
             "retrieval_mode": "CSV/cache only",
-            "google_cse_status": "available" if google_ready else "missing credentials",
+            "brave_search_status": "available" if brave_ready else "missing credentials",
+            "brave_search_credentials": "yes" if brave_ready else "no",
+            "google_cse_status": "legacy disabled",
+            "google_cse_legacy_status": "configured" if has_google_cse_credentials() else "missing credentials",
             "last_refresh": st.session_state.get("narrative_refreshed_at", "n/a") or "n/a",
             "items_fetched": len(narrative),
             "items_after_dedupe": len(all_items),
@@ -3419,6 +3752,7 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
             "items_used_in_aggregation": int(to_bool_series(details["included_in_aggregation"]).sum()) if not details.empty and "included_in_aggregation" in details.columns else 0,
             "items_excluded": max(len(details) - int(to_bool_series(details["included_in_aggregation"]).sum()), 0) if not details.empty and "included_in_aggregation" in details.columns else 0,
             "retrieval_source_counts": all_items_source_counts,
+            "brave_search_items": all_items_brave,
             "google_cse_items": all_items_google,
             "gdelt_items": all_items_gdelt,
             "rss_items": all_items_rss,
@@ -3434,18 +3768,20 @@ def narrative_monitor_view(frames: Dict[str, pd.DataFrame]) -> None:
 
     public_search_items = int(to_float(diagnostics.get("public_search_items", 0), 0))
     rss_only_usd = bool(diagnostics.get("rss_only_usd_warning"))
-    google_status = safe_text(diagnostics.get("google_cse_status", "missing credentials"))
+    brave_status = safe_text(diagnostics.get("brave_search_status", "missing credentials"))
     force_no_search = bool((has_live_attempt and public_search_items == 0) or rss_only_usd)
 
     if has_live_attempt and public_search_items == 0:
-        if google_status and google_status not in ["available", "disabled"]:
-            st.error("Google CSE failed. No broad currency narrative available.")
+        if not brave_ready:
+            st.error("No broad search provider configured. Add BRAVE_SEARCH_API_KEY.")
+        elif brave_status and brave_status not in ["available", "available / no results", "disabled"]:
+            st.error("Brave Search failed. No broad currency narrative available.")
         else:
-            st.warning("No Google search evidence retrieved. No broad currency narrative available.")
+            st.warning("No Brave search evidence retrieved. No broad currency narrative available.")
     elif rss_only_usd:
         st.warning("RSS fallback loaded USD-only sources. This is not treated as broad currency narrative coverage.")
     elif details.empty:
-        st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or click Refresh after Google CSE is configured.")
+        st.info("No public narrative data loaded yet. Add a narrative CSV/JSON export or click Refresh after BRAVE_SEARCH_API_KEY is configured.")
 
     display_summary = summary
     display_details = details
